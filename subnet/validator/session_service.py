@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import threading
 import time
+from hmac import compare_digest
 from typing import TYPE_CHECKING, Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
 
 from .session_errors import (
     AgentInferenceBudgetError,
@@ -25,7 +26,28 @@ class SessionRuntime:
 
     def __init__(self) -> None:
         self._registry: SessionRegistry | None = None
+        self._inference_grant: tuple[str, str, float] | None = None
         self._lock = threading.Lock()
+
+    def set_inference_grant(self, run_id: str, token: str, expires_at: float) -> None:
+        with self._lock:
+            self._inference_grant = (run_id, token, expires_at)
+
+    def clear_inference_grant(self) -> None:
+        with self._lock:
+            self._inference_grant = None
+
+    def authorize_inference(self, authorization: str | None) -> tuple[str | None, bool]:
+        with self._lock:
+            grant = self._inference_grant
+            if grant is None:
+                return None, False
+            authorized = (
+                time.time() < grant[2]
+                and authorization is not None
+                and compare_digest(authorization, "Bearer " + grant[1])
+            )
+            return grant[0], authorized
 
     def install(self, registry: SessionRegistry) -> None:
         """Atomically activate a registry and close the previous generation."""
@@ -68,6 +90,20 @@ def create_session_app(runtime: SessionRuntime) -> FastAPI:
     @app.get("/health")
     def health() -> dict[str, object]:
         return {"status": "ok", "ready": runtime.ready}
+
+    @app.get("/v1/inference/authorize")
+    def authorize_inference(
+        authorization: str | None = Header(default=None),
+    ) -> Response:
+        run_id, authorized = runtime.authorize_inference(authorization)
+        headers = {"X-ORO-Run-ID": run_id} if run_id else None
+        if not authorized:
+            raise HTTPException(
+                status_code=401,
+                detail="Inference key does not match active run",
+                headers=headers,
+            )
+        return Response(status_code=204, headers=headers)
 
     @app.post("/v1/session/call")
     def call(envelope: dict[str, Any]) -> dict[str, Any]:
