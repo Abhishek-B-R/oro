@@ -13,6 +13,8 @@ http {
     # filters tell `upstream-5xx-503` (Chutes parrot, dashboard) apart from
     # `internal-allowlist-unavailable` (proxy broken, page). See ORO-1159.
     js_set $proxy_outcome validate_model.outcome;
+    js_set $proxy_fields validate_model.fields;
+    js_set $proxy_run_id validate_model.runId;
 
     # Cross-worker shared cache for the inference allowlist. njs module-level
     # vars are per-worker, so 8 workers each cold-start with an empty cache
@@ -49,10 +51,10 @@ http {
     # tell upstream-relayed 5xx apart from proxy-internal failures. See
     # ORO-1159.
     log_format inference_combined '$remote_addr - $remote_user [$time_local] '
-                                  '"$request" $status $body_bytes_sent '
+                                  '"$request_method $uri" $status $body_bytes_sent '
                                   '"$http_referer" "$http_user_agent" '
                                   'ups=$upstream_status urt=$upstream_response_time '
-                                  'outcome=$proxy_outcome';
+                                  'outcome=$proxy_outcome run=$proxy_run_id fields=$proxy_fields';
 
     # Local-only stub_status endpoint for nginx-prometheus-exporter. On a
     # separate listener so it never conflicts with the public proxy paths
@@ -157,6 +159,7 @@ http {
         # Internal location for proxying validated requests to Chutes API
         location /_chutes_proxy/ {
             internal;
+            proxy_pass_request_headers off;
 
             # Per-request DNS via a configurable resolver. Default points at
             # the Docker-compose embedded resolver; environments without it
@@ -173,6 +176,7 @@ http {
 
             # Forward miner's auth token (set by ProxyClient from INFERENCE_ACCESS_TOKEN)
             proxy_set_header Authorization $http_authorization;
+            proxy_set_header Content-Type application/json;
             proxy_set_header Host ${CHUTES_HOST};
             proxy_set_header X-Identifier "orosn15";
             proxy_set_header X-Real-IP $remote_addr;
@@ -189,6 +193,7 @@ http {
         # Internal location for proxying validated requests to OpenRouter API.
         location /_openrouter_proxy/ {
             internal;
+            proxy_pass_request_headers off;
 
             # Per-request DNS via the configurable resolver (see /_chutes_proxy/
             # for the rationale). `ipv6=off` is required for openrouter.ai: it
@@ -206,6 +211,7 @@ http {
             # Forward miner's auth token (set by ProxyClient from
             # INFERENCE_ACCESS_TOKEN, populated per claim_work).
             proxy_set_header Authorization $http_authorization;
+            proxy_set_header Content-Type application/json;
             proxy_set_header Host ${OPENROUTER_HOST};
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

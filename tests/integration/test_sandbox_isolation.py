@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -154,7 +155,7 @@ class TestSandboxIsolation:
         )
 
     def test_inference_route_is_live(self, sandbox_container):
-        """/inference/* is owned by the njs validator: a body without a model is rejected there, not by the default deny."""
+        """Unauthenticated inference is rejected by the njs validator."""
         result = exec_in_container(
             sandbox_container,
             [
@@ -175,10 +176,87 @@ class TestSandboxIsolation:
 
         assert result.returncode == 0, result.stderr
         body, status = result.stdout.rsplit("\n", 1)
-        assert status == "400", (
+        assert status == "401", (
             f"Expected the model validator to answer, got {status}: {body[:200]}"
         )
-        assert "model" in json.loads(body)["error"]
+        assert "inference" in json.loads(body)["error"].lower()
+
+    def test_inference_requires_run_key_and_known_fields(self, sandbox_container):
+        mounts = json.loads(
+            subprocess.run(
+                ["docker", "inspect", PROXY_CONTAINER],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        )[0]["Mounts"]
+        grant_mount = next(
+            mount
+            for mount in mounts
+            if mount["Destination"] == "/run/oro-inference-grants"
+        )
+        volume = grant_mount.get("Name", grant_mount["Source"])
+        run_id = str(uuid4())
+
+        def volume_command(command):
+            subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "-v",
+                    f"{volume}:/grants",
+                    "nginx:alpine",
+                    "sh",
+                    "-c",
+                    command,
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+        volume_command(
+            "set -C; printf '%s' '"
+            + json.dumps({"run_id": run_id, "token": "sk-or-expected"})
+            + "' > /grants/active"
+        )
+        try:
+            for key, body, expected_status, expected_error in (
+                ("sk-or-other", "{}", "401", "Inference key does not match active run"),
+                ("sk-or-expected", "{}", "400", "Missing 'model' field"),
+                (
+                    "sk-or-expected",
+                    '{"model":"test/model","messages":[],"provider":{"only":["x"]}}',
+                    "400",
+                    "Unsupported inference request fields",
+                ),
+            ):
+                response = exec_in_container(
+                    sandbox_container,
+                    [
+                        "curl",
+                        "-s",
+                        "--max-time",
+                        "5",
+                        "-w",
+                        "\n%{http_code}",
+                        "-H",
+                        f"Authorization: Bearer {key}",
+                        "-H",
+                        "Content-Type: application/json",
+                        "-d",
+                        body,
+                        "http://proxy:80/inference/chat/completions",
+                    ],
+                    timeout=10,
+                )
+                assert response.returncode == 0, response.stderr
+                response_body, status = response.stdout.rsplit("\n", 1)
+                assert status == expected_status
+                assert json.loads(response_body)["error"].startswith(expected_error)
+        finally:
+            volume_command("unlink /grants/active")
 
     def test_session_calls_route_only_through_proxy(self, sandbox_container):
         """A grouped solver turn reaches the real SessionServer only through nginx."""

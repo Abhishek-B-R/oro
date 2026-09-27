@@ -1,6 +1,5 @@
-// Inference proxy: validates outgoing requests against the per-provider
-// allowlist before forwarding to either Chutes or OpenRouter, dispatched
-// by the bearer token's prefix.
+// Inference proxy: binds each request to a validator-owned run grant and
+// validates its model and request fields before forwarding upstream.
 //
 // The allowlists are fetched from the ORO Backend (`GET
 // /v1/public/inference/models?provider=<name>`) via the internal
@@ -48,6 +47,14 @@ function _tag(r, label) {
 
 function outcome(r) {
   return r._oroOutcome || "unknown";
+}
+
+function fields(r) {
+  return r._oroFields || "-";
+}
+
+function runId(r) {
+  return r._oroRunId || "-";
 }
 
 // Build the upstream-* label from a subrequest reply status. Keeps the label
@@ -182,20 +189,32 @@ function getAllowlist(r, provider, callback) {
 }
 
 function validate(r) {
-  var provider = detectProvider(r);
-  var upstreamLocation = provider === "openrouter" ? "/_openrouter_proxy/" : "/_chutes_proxy/";
-
-  if (r.method !== "POST") {
-    var passUri = upstreamLocation + r.uri.replace(/^\/inference\//, "");
-    r.subrequest(passUri, { method: r.method, args: r.variables.args || "" }, function (reply) {
-      _tag(r, _upstreamLabel(reply.status));
-      for (var h in reply.headersOut) {
-        r.headersOut[h] = reply.headersOut[h];
-      }
-      r.return(reply.status, reply.responseText);
-    });
+  if (r.uri !== "/inference/chat/completions" || r.method !== "POST" || r.variables.args) {
+    _tag(r, "internal-bad-request");
+    r.return(400, JSON.stringify({ error: "Unsupported inference endpoint, method, or query" }));
     return;
   }
+
+  // This proxy serves one evaluation at a time. The validator atomically
+  // publishes its active key in a volume unavailable to the sandbox.
+  var bearer = r.headersIn["Authorization"] || "";
+  var grant;
+  try {
+    grant = JSON.parse(fs.readFileSync("/run/oro-inference-grants/active", "utf8"));
+  } catch (e) {
+    _tag(r, "internal-unauthorized");
+    r.return(401, JSON.stringify({ error: "No active inference run" }));
+    return;
+  }
+  if (!grant || typeof grant.token !== "string" || bearer !== "Bearer " + grant.token) {
+    _tag(r, "internal-unauthorized");
+    r.return(401, JSON.stringify({ error: "Inference key does not match active run" }));
+    return;
+  }
+  r._oroRunId = grant.run_id;
+
+  var provider = detectProvider(r);
+  var upstreamLocation = provider === "openrouter" ? "/_openrouter_proxy/" : "/_chutes_proxy/";
 
   var body = r.requestText;
 
@@ -216,7 +235,8 @@ function validate(r) {
     return;
   }
 
-  if (!parsed.model) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+      typeof parsed.model !== "string" || !parsed.model) {
     _tag(r, "internal-bad-request");
     r.headersOut["Content-Type"] = "application/json";
     r.return(400, JSON.stringify({ error: "Missing 'model' field in request body" }));
@@ -230,20 +250,26 @@ function validate(r) {
     return;
   }
 
-  // Enforce the allowlist across the whole request, not just the scalar `model`.
-  // OpenRouter also honours `models[]` (candidate list), `provider` preferences,
-  // `route`, `transforms`, and `preset`; strip them so every request runs on the
-  // single validated model rather than one steered by these fields. Log any that
-  // were present — the proxy does not otherwise record them.
-  var stripped = [];
-  ["models", "provider", "route", "transforms", "preset"].forEach(function (f) {
-    if (parsed[f] !== undefined) {
-      delete parsed[f];
-      stripped.push(f);
-    }
+  // Only request fields that configure the validated chat completion may
+  // reach upstream. The proxy owns routing and usage accounting.
+  var permitted = [
+    "model", "messages", "tools", "tool_choice", "temperature", "top_p",
+    "top_k", "max_tokens", "max_completion_tokens", "stop", "seed",
+    "frequency_penalty", "presence_penalty", "repetition_penalty",
+    "response_format", "reasoning", "include_reasoning", "verbosity",
+    "logprobs", "top_logprobs", "parallel_tool_calls", "stream",
+  ];
+  var unknown = Object.keys(parsed).filter(function (field) {
+    return permitted.indexOf(field) === -1;
   });
-  if (stripped.length > 0) {
-    r.error("stripped inference routing fields: " + stripped.join(","));
+  // Add field shape to the existing access log, without values or extra lines.
+  r._oroFields = permitted.filter(function (field) {
+    return parsed[field] !== undefined;
+  }).join(",") + ":" + unknown.length;
+  if (unknown.length > 0) {
+    _tag(r, "internal-bad-request");
+    r.return(400, JSON.stringify({ error: "Unsupported inference request fields" }));
+    return;
   }
 
   // OpenRouter only returns `usage.cost` (USD) on the response when the
@@ -262,12 +288,8 @@ function validate(r) {
   // user-simulator runs on Mistral Small, which has been rate-limiting (429) on
   // OpenRouter and hard-failing episodes. Re-add an OpenRouter `models[]`
   // candidate list so OpenRouter itself fails over to the Qwen instruct model on
-  // a primary 429/5xx. The strip above (#260) removes a *client-supplied*
-  // models[] to stop a caller steering onto an unvalidated model; this list is
-  // proxy-hardcoded to two known models and is not client-controllable, so that
-  // threat model does not apply. The scalar `parsed.model` stays Mistral, so the
-  // allowlist check below still validates the primary. The fallback entry is
-  // intentionally NOT allowlist-validated (proxy-authored exception). OpenRouter
+  // a primary 429/5xx. The scalar `parsed.model` stays Mistral; both entries
+  // must pass the live allowlist check below. OpenRouter
   // only. TODO(ORO): replay-parity + record served model before relying on this
   // for scoring — cross-validator fallback timing adds score variance.
   var fallbackInjected = false;
@@ -284,7 +306,7 @@ function validate(r) {
     parsed.model = rewritten;
   }
   var forwardBody =
-    rewritten !== null || stripped.length > 0 || usageInjected || fallbackInjected
+    rewritten !== null || usageInjected || fallbackInjected
       ? JSON.stringify(parsed)
       : body;
 
@@ -298,7 +320,7 @@ function validate(r) {
 
     if (allowed.indexOf(parsed.model) === -1) {
       _tag(r, "internal-model-not-allowed");
-      r.error("Model not allowed for " + provider + ": " + parsed.model);
+      r.error("Model not allowed for " + provider);
       r.headersOut["Content-Type"] = "application/json";
       r.return(
         403,
@@ -309,6 +331,11 @@ function validate(r) {
       );
       return;
     }
+    if (fallbackInjected && allowed.indexOf("qwen/qwen3-30b-a3b-instruct-2507") === -1) {
+      _tag(r, "internal-model-not-allowed");
+      r.return(403, JSON.stringify({ error: "Inference fallback model is not allowed" }));
+      return;
+    }
 
     var uri = upstreamLocation + r.uri.replace(/^\/inference\//, "");
     r.subrequest(
@@ -316,22 +343,6 @@ function validate(r) {
       { method: "POST", body: forwardBody, args: r.variables.args || "" },
       function (reply) {
         _tag(r, _upstreamLabel(reply.status));
-        // Belt-and-suspenders forensic trail for ORO-2191. The Python side
-        // (SimulatorCompletion / ProxyClient.last_error) also captures the
-        // body, but a message posted here survives even for callers that
-        // don't read last_error yet — grep the proxy container logs on any
-        // env_error incident for the actual upstream reason.
-        if (reply.status >= 400) {
-          var body = reply.responseText || "";
-          r.error(
-            "upstream " +
-              reply.status +
-              " on " +
-              r.uri +
-              " body: " +
-              body.substring(0, 800)
-          );
-        }
         for (var h in reply.headersOut) {
           r.headersOut[h] = reply.headersOut[h];
         }
@@ -341,4 +352,4 @@ function validate(r) {
   });
 }
 
-export default { validate: validate, outcome: outcome };
+export default { validate: validate, outcome: outcome, fields: fields, runId: runId };

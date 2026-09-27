@@ -1636,7 +1636,17 @@ class Validator:
         heartbeat_mgr.start()
         logging.info(f"Heartbeat manager started for {eval_run_id_str}")
 
+        grant_dir = Path(
+            os.environ.get("ORO_INFERENCE_GRANTS_DIR", "/run/oro-inference-grants")
+        )
+        grant_path = grant_dir / "active"
+        temporary_grant = grant_dir / f".{eval_run_id_str}.tmp"
         try:
+            grant_dir.mkdir(parents=True, exist_ok=True)
+            temporary_grant.write_text(
+                json.dumps({"run_id": eval_run_id_str, "token": inference_access_token})
+            )
+            temporary_grant.replace(grant_path)
             # Step 1: Download agent code
             agent_path = self.download_agent(work.code_download_url, eval_run_id_str)
             if not agent_path:
@@ -1675,6 +1685,8 @@ class Validator:
                 sandbox_metadata=sandbox_metadata,
             )
         finally:
+            temporary_grant.unlink(missing_ok=True)
+            grant_path.unlink(missing_ok=True)
             heartbeat_mgr.stop()
             if not heartbeat_mgr.is_healthy():
                 logging.warning(f"Heartbeat failures occurred during {eval_run_id_str}")

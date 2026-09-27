@@ -25,6 +25,11 @@ from subnet.validator.session_service import SessionRuntime
 pytest_plugins = ("tests.compat_fixture",)
 
 
+@pytest.fixture(autouse=True)
+def local_inference_grants(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("ORO_INFERENCE_GRANTS_DIR", str(tmp_path / "inference-grants"))
+
+
 def _pack(families: list[str]) -> SimpleNamespace:
     return SimpleNamespace(
         task_specs=[SimpleNamespace(family=family) for family in families],

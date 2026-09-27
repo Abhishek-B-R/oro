@@ -452,6 +452,11 @@ def run_local_generated_validator(
         raise ValueError("timeout must be positive")
 
     run_id = f"local-{uuid4().hex}"
+    grant_dir = Path(
+        os.environ.get("ORO_INFERENCE_GRANTS_DIR", "/run/oro-inference-grants")
+    )
+    grant_path = grant_dir / "active"
+    temporary_grant = grant_dir / f".{run_id}.tmp"
     artifact_dir = config.output_root / run_id
     artifact_dir.mkdir(parents=True, exist_ok=False)
     artifact_dir.chmod(0o755)
@@ -481,6 +486,11 @@ def run_local_generated_validator(
     # the file is edited or removed mid-run.
     agent_identity: str | None = None
     try:
+        grant_dir.mkdir(parents=True, exist_ok=True)
+        temporary_grant.write_text(
+            json.dumps({"run_id": run_id, "token": config.inference_access_token})
+        )
+        temporary_grant.replace(grant_path)
         _write_summary(
             summary_path,
             run_id=run_id,
@@ -701,6 +711,8 @@ def run_local_generated_validator(
             summary_path=summary_path,
         )
     finally:
+        temporary_grant.unlink(missing_ok=True)
+        grant_path.unlink(missing_ok=True)
         cleanup_error = _cleanup(
             container_name=container_name,
             remove_container=remove_container,
