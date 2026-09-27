@@ -50,6 +50,14 @@ function outcome(r) {
   return r._oroOutcome || "unknown";
 }
 
+function fields(r) {
+  return r._oroFields || "-";
+}
+
+function runId(r) {
+  return r._oroRunId || "-";
+}
+
 // Build the upstream-* label from a subrequest reply status. Keeps the label
 // space small enough for CloudWatch term-match patterns: filters key off the
 // `upstream-2xx-` / `upstream-4xx-` / `upstream-5xx-` prefix.
@@ -182,6 +190,25 @@ function getAllowlist(r, provider, callback) {
 }
 
 function validate(r) {
+  // The sandbox can supply any bearer; only the validator's active grant may
+  // reach upstream. Keep the existing request and model handling below.
+  var grant;
+  try {
+    grant = JSON.parse(fs.readFileSync("/run/oro-inference-grants/active", "utf8"));
+  } catch (e) {
+    _tag(r, "internal-unauthorized");
+    r.return(401, JSON.stringify({ error: "No active inference run" }));
+    return;
+  }
+  r._oroRunId = grant && grant.run_id;
+  if (!grant || typeof grant.token !== "string" ||
+      typeof grant.expires_at !== "number" || Date.now() >= grant.expires_at ||
+      r.headersIn["Authorization"] !== "Bearer " + grant.token) {
+    _tag(r, "internal-unauthorized");
+    r.return(401, JSON.stringify({ error: "Inference key does not match active run" }));
+    return;
+  }
+
   var provider = detectProvider(r);
   var upstreamLocation = provider === "openrouter" ? "/_openrouter_proxy/" : "/_chutes_proxy/";
 
@@ -215,6 +242,18 @@ function validate(r) {
     r.return(400, JSON.stringify({ error: "Invalid JSON in request body" }));
     return;
   }
+
+  // Capture caller fields before validation, stripping, or proxy additions.
+  // Bound both log size and work on a request with many top-level keys.
+  var names = [];
+  for (var name in parsed || {}) {
+    if (names.length === 32) {
+      names.push("+more");
+      break;
+    }
+    names.push(name.slice(0, 64).replace(/[^A-Za-z0-9_.-]/g, "_"));
+  }
+  r._oroFields = names.join(",");
 
   if (!parsed.model) {
     _tag(r, "internal-bad-request");
@@ -341,4 +380,4 @@ function validate(r) {
   });
 }
 
-export default { validate: validate, outcome: outcome };
+export default { validate: validate, outcome: outcome, fields: fields, runId: runId };

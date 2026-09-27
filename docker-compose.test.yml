@@ -25,7 +25,10 @@ services:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:9101/health').read()\""]
 
   proxy:
+    volumes:
+      - test-inference-grants:/run/oro-inference-grants:ro
     environment:
+      - ORO_INFERENCE_TEST_PROXY=1
       - SESSION_RUNTIME_HOST=session-runtime
       - SESSION_RUNTIME_PORT=9101
     depends_on:
