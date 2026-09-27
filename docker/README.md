@@ -233,7 +233,7 @@ The proxy service acts as a gateway for sandboxed agent containers, providing co
 - **Sandbox Network**: Internal Docker network (no internet access) for agent containers
 - **Path-based Routing**:
   - `/environment/call` → session runtime (ORO Bench tool actions)
-  - `/inference/*` → Chutes API (external, auth forwarded from sandbox client)
+  - `POST /inference/chat/completions` → the run's configured inference provider
   - `/search/*` → 410 Gone (ShoppingBench routes, removed)
 
 ### Network Topology
@@ -251,6 +251,17 @@ Internet
 ```
 
 ### Building and Running
+
+Inference requests must use the validator-issued run key. The proxy accepts a
+single `model` and standard chat completion controls: `messages`, `tools`,
+`tool_choice`, `temperature`, `top_p`, `top_k`, `top_a`, `min_p`, `max_tokens`,
+`max_completion_tokens`, `stop`, `seed`, `n`, `logit_bias`,
+`frequency_penalty`, `presence_penalty`, `repetition_penalty`,
+`response_format`, `reasoning`, `reasoning_effort`, `include_reasoning`,
+`verbosity`, `logprobs`, `top_logprobs`, `parallel_tool_calls`, `stream`
+(false only), `stream_options`, `user`, `metadata`, `chat_template_kwargs`, and
+`usage` (which the proxy sets for OpenRouter). Query parameters and request
+fields that steer routing or add provider tools are rejected.
 
 ```bash
 # Build proxy image

@@ -5,6 +5,13 @@
 # case (`docker compose --profile tools up`) is unchanged — this file
 # is only loaded when explicitly passed via `-f`.
 services:
+  inference-mock:
+    build:
+      context: .
+      dockerfile: tests/integration/inference-mock.Dockerfile
+    networks:
+      - main
+
   # The isolation suite verifies network topology and proxy routing, not search
   # relevance. Avoid loading the ~15 GB production search image on a standard
   # GitHub runner; return the empty result the existing assertion already permits.
@@ -26,9 +33,16 @@ services:
 
   proxy:
     environment:
+      - ORO_INFERENCE_TEST_PROXY=1
+      - BACKEND_URL=https://inference-mock
+      - BACKEND_HOST=inference-mock
+      - OPENROUTER_HOST=inference-mock
+      - CHUTES_HOST=inference-mock
       - SESSION_RUNTIME_HOST=session-runtime
       - SESSION_RUNTIME_PORT=9101
     depends_on:
+      inference-mock:
+        condition: service_started
       session-runtime:
         condition: service_healthy
 

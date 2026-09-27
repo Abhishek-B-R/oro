@@ -12,6 +12,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -488,7 +489,13 @@ def run_local_generated_validator(
     try:
         grant_dir.mkdir(parents=True, exist_ok=True)
         temporary_grant.write_text(
-            json.dumps({"run_id": run_id, "token": config.inference_access_token})
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "token": config.inference_access_token,
+                    "expires_at": (time.time() + config.timeout + 300) * 1000,
+                }
+            )
         )
         temporary_grant.replace(grant_path)
         _write_summary(

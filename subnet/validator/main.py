@@ -551,9 +551,7 @@ class Validator:
         logging.info(f"Running sandbox for eval_run {eval_run_id}")
         log_cmd = [
             arg.split("=")[0] + "=***"
-            if any(
-                s in arg for s in ("INFERENCE_ACCESS_TOKEN=",)
-            )
+            if any(s in arg for s in ("INFERENCE_ACCESS_TOKEN=",))
             else arg
             for arg in cmd
         ]
@@ -757,6 +755,11 @@ class Validator:
     def run(self):
         """Main validation loop - claims work from Backend and executes evaluations."""
         logging.info("Starting validator loop.")
+        # A watchdog exit skips run_evaluation_cycle's finally block.
+        grant_dir = Path(
+            os.environ.get("ORO_INFERENCE_GRANTS_DIR", "/run/oro-inference-grants")
+        )
+        (grant_dir / "active").unlink(missing_ok=True)
 
         # Validate the optional startup gate before starting any background
         # service.  A mixed configuration (runtime enabled without a valid
@@ -1644,7 +1647,14 @@ class Validator:
         try:
             grant_dir.mkdir(parents=True, exist_ok=True)
             temporary_grant.write_text(
-                json.dumps({"run_id": eval_run_id_str, "token": inference_access_token})
+                json.dumps(
+                    {
+                        "run_id": eval_run_id_str,
+                        "token": inference_access_token,
+                        "expires_at": work.inference_token.expires_at.timestamp()
+                        * 1000,
+                    }
+                )
             )
             temporary_grant.replace(grant_path)
             # Step 1: Download agent code

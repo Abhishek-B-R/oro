@@ -6,14 +6,16 @@ Tests that sandbox containers are properly isolated and can only communicate thr
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
-from uuid import uuid4
 
 import pytest
+import requests
 
 from subnet.sandbox import build_sandbox_command
 from tests.integration.conftest import (
     PROXY_CONTAINER,
+    PROXY_PORT,
     SEARCH_SERVER_CONTAINER,
     SESSION_RUNTIME_CONTAINER,
     exec_in_container,
@@ -181,82 +183,117 @@ class TestSandboxIsolation:
         )
         assert "inference" in json.loads(body)["error"].lower()
 
-    def test_inference_requires_run_key_and_known_fields(self, sandbox_container):
-        mounts = json.loads(
+    def test_inference_requires_run_key_and_known_fields(self):
+        proxy = json.loads(
             subprocess.run(
                 ["docker", "inspect", PROXY_CONTAINER],
                 capture_output=True,
                 text=True,
                 check=True,
             ).stdout
-        )[0]["Mounts"]
+        )[0]
+        assert "ORO_INFERENCE_TEST_PROXY=1" in proxy["Config"]["Env"]
         grant_mount = next(
-            mount
-            for mount in mounts
-            if mount["Destination"] == "/run/oro-inference-grants"
+            (
+                mount
+                for mount in proxy["Mounts"]
+                if mount["Destination"] == "/run/oro-inference-grants"
+            ),
+            None,
+        )
+        assert grant_mount is not None, (
+            "test proxy is missing its inference grant volume"
         )
         volume = grant_mount.get("Name", grant_mount["Source"])
-        run_id = str(uuid4())
-
-        def volume_command(command):
-            subprocess.run(
-                [
-                    "docker",
-                    "run",
-                    "--rm",
-                    "-v",
-                    f"{volume}:/grants",
-                    "nginx:alpine",
-                    "sh",
-                    "-c",
-                    command,
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-
-        volume_command(
-            "set -C; printf '%s' '"
-            + json.dumps({"run_id": run_id, "token": "sk-or-expected"})
-            + "' > /grants/active"
+        container = [
+            "docker",
+            "run",
+            "--rm",
+            "-i",
+            "-v",
+            f"{volume}:/grants",
+            "nginx:alpine",
+        ]
+        subprocess.run(
+            container + ["sh", "-c", "set -C; cat > /grants/active"],
+            input=json.dumps(
+                {
+                    "run_id": "integration-test",
+                    "token": "sk-or-expected",
+                    "expires_at": (time.time() + 600) * 1000,
+                }
+            ),
+            text=True,
+            capture_output=True,
+            check=True,
         )
         try:
             for key, body, expected_status, expected_error in (
-                ("sk-or-other", "{}", "401", "Inference key does not match active run"),
-                ("sk-or-expected", "{}", "400", "Missing 'model' field"),
+                ("sk-or-other", {}, 401, "Inference key does not match active run"),
+                ("sk-or-expected", {}, 400, "Missing 'model' field"),
                 (
                     "sk-or-expected",
-                    '{"model":"test/model","messages":[],"provider":{"only":["x"]}}',
-                    "400",
+                    {
+                        "model": "test/model",
+                        "messages": [],
+                        "provider": {"only": ["x"]},
+                    },
+                    400,
                     "Unsupported inference request fields",
                 ),
+                (
+                    "sk-or-expected",
+                    {
+                        "model": "test/model",
+                        "messages": [],
+                        "n": 1,
+                        "logit_bias": {"42": 1},
+                    },
+                    200,
+                    None,
+                ),
+                (
+                    "sk-or-expected",
+                    {"model": "mistralai/mistral-small-2603", "messages": []},
+                    200,
+                    None,
+                ),
             ):
-                response = exec_in_container(
-                    sandbox_container,
-                    [
-                        "curl",
-                        "-s",
-                        "--max-time",
-                        "5",
-                        "-w",
-                        "\n%{http_code}",
-                        "-H",
-                        f"Authorization: Bearer {key}",
-                        "-H",
-                        "Content-Type: application/json",
-                        "-d",
-                        body,
-                        "http://proxy:80/inference/chat/completions",
-                    ],
-                    timeout=10,
+                response = requests.post(
+                    f"http://127.0.0.1:{PROXY_PORT}/inference/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "X-OpenRouter-Route": "attacker-choice",
+                    },
+                    json=body,
+                    timeout=5,
                 )
-                assert response.returncode == 0, response.stderr
-                response_body, status = response.stdout.rsplit("\n", 1)
-                assert status == expected_status
-                assert json.loads(response_body)["error"].startswith(expected_error)
+                assert response.status_code == expected_status
+                if expected_error:
+                    assert response.json()["error"].startswith(expected_error)
+                else:
+                    assert response.json()["model"] == "test/model"
+            subprocess.run(
+                container + ["sh", "-c", "cat > /grants/active"],
+                input=json.dumps(
+                    {
+                        "run_id": "integration-test",
+                        "token": "sk-or-expected",
+                        "expires_at": 0,
+                    }
+                ),
+                text=True,
+                check=True,
+            )
+            expired = requests.post(
+                f"http://127.0.0.1:{PROXY_PORT}/inference/chat/completions",
+                headers={"Authorization": "Bearer sk-or-expected"},
+                json={"model": "test/model", "messages": []},
+                timeout=5,
+            )
+            assert expired.status_code == 401
         finally:
-            volume_command("unlink /grants/active")
+            subprocess.run(container + ["unlink", "/grants/active"], check=True)
 
     def test_session_calls_route_only_through_proxy(self, sandbox_container):
         """A grouped solver turn reaches the real SessionServer only through nginx."""

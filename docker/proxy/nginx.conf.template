@@ -102,6 +102,7 @@ http {
         location /inference/ {
             limit_req zone=agent burst=50 nodelay;
             client_body_buffer_size 1m;
+            default_type application/json;
             js_content validate_model.validate;
         }
 

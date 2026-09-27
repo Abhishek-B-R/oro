@@ -116,6 +116,15 @@ var CACHE_TTL_MS = 15 * 60 * 1000;
 var STALE_GRACE_MS = 60 * 60 * 1000;
 
 var ZONE = "oro_models";
+var PERMITTED_FIELDS = [
+  "model", "messages", "tools", "tool_choice", "temperature", "top_p",
+  "top_k", "top_a", "min_p", "max_tokens", "max_completion_tokens", "stop",
+  "seed", "n", "logit_bias", "frequency_penalty", "presence_penalty",
+  "repetition_penalty", "response_format", "reasoning", "reasoning_effort",
+  "include_reasoning", "verbosity", "logprobs", "top_logprobs",
+  "parallel_tool_calls", "stream", "stream_options", "user", "metadata",
+  "chat_template_kwargs", "usage",
+];
 
 function _stateKey(provider) {
   return "state:" + provider;
@@ -206,7 +215,9 @@ function validate(r) {
     r.return(401, JSON.stringify({ error: "No active inference run" }));
     return;
   }
-  if (!grant || typeof grant.token !== "string" || bearer !== "Bearer " + grant.token) {
+  if (!grant || typeof grant.token !== "string" ||
+      typeof grant.expires_at !== "number" ||
+      Date.now() >= grant.expires_at || bearer !== "Bearer " + grant.token) {
     _tag(r, "internal-unauthorized");
     r.return(401, JSON.stringify({ error: "Inference key does not match active run" }));
     return;
@@ -220,7 +231,6 @@ function validate(r) {
 
   if (!body) {
     _tag(r, "internal-bad-request");
-    r.headersOut["Content-Type"] = "application/json";
     r.return(400, JSON.stringify({ error: "Missing or unreadable request body" }));
     return;
   }
@@ -230,7 +240,6 @@ function validate(r) {
     parsed = JSON.parse(body);
   } catch (e) {
     _tag(r, "internal-bad-request");
-    r.headersOut["Content-Type"] = "application/json";
     r.return(400, JSON.stringify({ error: "Invalid JSON in request body" }));
     return;
   }
@@ -238,32 +247,23 @@ function validate(r) {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
       typeof parsed.model !== "string" || !parsed.model) {
     _tag(r, "internal-bad-request");
-    r.headersOut["Content-Type"] = "application/json";
     r.return(400, JSON.stringify({ error: "Missing 'model' field in request body" }));
     return;
   }
 
   if (parsed.stream === true) {
     _tag(r, "internal-bad-request");
-    r.headersOut["Content-Type"] = "application/json";
     r.return(400, JSON.stringify({ error: "Streaming is not supported through the proxy" }));
     return;
   }
 
   // Only request fields that configure the validated chat completion may
   // reach upstream. The proxy owns routing and usage accounting.
-  var permitted = [
-    "model", "messages", "tools", "tool_choice", "temperature", "top_p",
-    "top_k", "max_tokens", "max_completion_tokens", "stop", "seed",
-    "frequency_penalty", "presence_penalty", "repetition_penalty",
-    "response_format", "reasoning", "include_reasoning", "verbosity",
-    "logprobs", "top_logprobs", "parallel_tool_calls", "stream",
-  ];
   var unknown = Object.keys(parsed).filter(function (field) {
-    return permitted.indexOf(field) === -1;
+    return PERMITTED_FIELDS.indexOf(field) === -1;
   });
   // Add field shape to the existing access log, without values or extra lines.
-  r._oroFields = permitted.filter(function (field) {
+  r._oroFields = PERMITTED_FIELDS.filter(function (field) {
     return parsed[field] !== undefined;
   }).join(",") + ":" + unknown.length;
   if (unknown.length > 0) {
@@ -278,42 +278,15 @@ function validate(r) {
   // tracking) and miner agent code can then read `resp.usage.cost`
   // deterministically. Chutes ignores unknown top-level fields but skip
   // there to keep the outbound body untouched.
-  var usageInjected = false;
   if (provider === "openrouter") {
     parsed.usage = { include: true };
-    usageInjected = true;
   }
 
-  // Proxy-authored fallback for the shopper user-simulator. The validator's
-  // user-simulator runs on Mistral Small, which has been rate-limiting (429) on
-  // OpenRouter and hard-failing episodes. Re-add an OpenRouter `models[]`
-  // candidate list so OpenRouter itself fails over to the Qwen instruct model on
-  // a primary 429/5xx. The scalar `parsed.model` stays Mistral; both entries
-  // must pass the live allowlist check below. OpenRouter
-  // only. TODO(ORO): replay-parity + record served model before relying on this
-  // for scoring — cross-validator fallback timing adds score variance.
-  var fallbackInjected = false;
-  if (provider === "openrouter" && parsed.model === "mistralai/mistral-small-2603") {
-    parsed.models = [
-      "mistralai/mistral-small-2603",
-      "qwen/qwen3-30b-a3b-instruct-2507",
-    ];
-    fallbackInjected = true;
-  }
-
-  var rewritten = rewriteModelFor(provider, parsed.model);
-  if (rewritten !== null) {
-    parsed.model = rewritten;
-  }
-  var forwardBody =
-    rewritten !== null || usageInjected || fallbackInjected
-      ? JSON.stringify(parsed)
-      : body;
+  parsed.model = rewriteModelFor(provider, parsed.model) || parsed.model;
 
   getAllowlist(r, provider, function (allowed) {
     if (!allowed) {
       _tag(r, "internal-allowlist-unavailable");
-      r.headersOut["Content-Type"] = "application/json";
       r.return(503, JSON.stringify({ error: "Inference allowlist unavailable" }));
       return;
     }
@@ -321,7 +294,6 @@ function validate(r) {
     if (allowed.indexOf(parsed.model) === -1) {
       _tag(r, "internal-model-not-allowed");
       r.error("Model not allowed for " + provider);
-      r.headersOut["Content-Type"] = "application/json";
       r.return(
         403,
         JSON.stringify({
@@ -331,16 +303,17 @@ function validate(r) {
       );
       return;
     }
-    if (fallbackInjected && allowed.indexOf("qwen/qwen3-30b-a3b-instruct-2507") === -1) {
-      _tag(r, "internal-model-not-allowed");
-      r.return(403, JSON.stringify({ error: "Inference fallback model is not allowed" }));
-      return;
+    // Keep the simulator's proxy-authored fallback only while it is allowed.
+    var fallback = "qwen/qwen3-30b-a3b-instruct-2507";
+    if (provider === "openrouter" && parsed.model === "mistralai/mistral-small-2603" &&
+        allowed.indexOf(fallback) !== -1) {
+      parsed.models = [parsed.model, fallback];
     }
 
     var uri = upstreamLocation + r.uri.replace(/^\/inference\//, "");
     r.subrequest(
       uri,
-      { method: "POST", body: forwardBody, args: r.variables.args || "" },
+      { method: "POST", body: JSON.stringify(parsed) },
       function (reply) {
         _tag(r, _upstreamLabel(reply.status));
         for (var h in reply.headersOut) {

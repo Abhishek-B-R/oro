@@ -36,7 +36,7 @@ jobs:
 
       - name: Build services
         run: |
-          docker compose build search-server session-runtime proxy sandbox
+          docker compose build search-server session-runtime inference-mock proxy sandbox
 
       - name: Start search server
         run: |
