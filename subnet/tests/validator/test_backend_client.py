@@ -484,6 +484,32 @@ class TestBackendClientErrorHandling:
             assert exc_info.value.is_transient
             assert exc_info.value.status_code is None
 
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            pytest.param(httpx.ReadError("connection reset by peer"), id="read-error"),
+            pytest.param(httpx.WriteError("broken pipe"), id="write-error"),
+            pytest.param(
+                httpx.RemoteProtocolError("Server disconnected without sending a response."),
+                id="server-disconnected",
+            ),
+        ],
+    )
+    def test_dropped_connection_is_transient(self, mock_wallet, exc):
+        """A connection that drops mid-request is transient like a refused one,
+        not a raw httpx error that callers catching BackendError never see."""
+        client = BackendClient("https://api.example.com", mock_wallet)
+
+        with patch(
+            "validator.backend_client.claim_work.sync_detailed",
+            side_effect=exc,
+        ):
+            with pytest.raises(BackendError) as exc_info:
+                client.claim_work()
+
+            assert exc_info.value.is_transient
+            assert exc_info.value.status_code is None
+
     def test_sdk_parse_error_surfaces_actionable_message(self, mock_wallet):
         """SDK response parsing failures (e.g. KeyError('loc')) raise a
         descriptive BackendError instead of bubbling up an opaque KeyError.
