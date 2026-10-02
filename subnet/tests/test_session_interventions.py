@@ -8,7 +8,10 @@ import json
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import pytest
 
+
+from oro_env_runtime import loop
 from oro_env_runtime.schema import Event
 from oro_env_runtime.situation import (
     AfterTransition,
@@ -161,7 +164,7 @@ def test_price_notice_preserves_event_currency(loaded_pack):
                 currency=state.session.task.hard.currency,
             )
         )
-        state.event_fired_turn = 1
+        state.event_fired_turns[0] = 1
         _call(registry, 2)
         assert sim.last_signal == {
             "kind": "price_change",
@@ -378,3 +381,67 @@ def test_a_turn_3_cut_is_heard_before_an_order_on_turn_3(loaded_pack):
     assert said.payload["content"] == cut_line
     graded = evaluate(situation, ledger, {})
     assert graded.fired == ("cut",) and graded.checks["requirement:budget:cut"] is False
+
+
+@pytest.mark.parametrize(
+    ("band", "inspect_turn", "noticed_events", "noticed_turns"),
+    [
+        ("standard", None, [0, 2], [3, 7]),
+        ("hard", None, [0, 2], [4, 8]),
+        # On the hard band an event the agent already saw needs no notice.
+        ("hard", 2, [2], [8]),
+    ],
+)
+def test_each_announced_market_change_gets_its_own_notice_in_order(
+    loaded_pack, band, inspect_turn, noticed_events, noticed_turns
+):
+    """As loop.run tracks them: every announced change is noticed once, one turn after
+    it fires (two on the hard band) and in firing order; a silent change in between
+    never gets a notice."""
+    task = loaded_pack.task_specs[0]
+    hard, item = task.hard, task.gold_set[0]
+
+    def change(turn, presentation="announced"):
+        return Transition(
+            id=f"market:{turn}",
+            trigger=SolverTurn(turn=turn),
+            effects=[
+                MarketChange(
+                    change="price_change",
+                    price_multiplier=1.1,
+                    target="keys",
+                    keys=[item.key()],
+                    presentation=presentation,
+                )
+            ],
+        )
+
+    situation = Situation(
+        preset="boundary",
+        requirements=[
+            Requirement(id="budget", predicate=Budget(max=hard.budget, currency=hard.currency))
+        ],
+        timeline=[change(2), change(3, "silent"), change(6)],
+    )
+    with _registry(loaded_pack, situation) as (registry, state, sim):
+        state.session.task = state.session.task.model_copy(update={"difficulty_band": band})
+        signals = []
+
+        async def respond(transcript, signal):
+            signals.append(signal)
+            return {"action": "no_op", "content": "", "reason": "test"}
+
+        sim.respond = respond
+        inspect = {"name": "inspect_stock", "args": item.model_dump()}
+        for turn in range(1, 10):
+            _call(registry, turn, [inspect] if turn == inspect_turn else None)
+        env = state.session.env
+
+    assert env.announced_events() == [0, 2]
+    assert signals == [loop._event_signal(env.applied_events[i]) for i in noticed_events]
+    noticed = [
+        entry.turn
+        for entry in env.ledger.entries()
+        if entry.kind == "user_message" and entry.payload.get("env_signal")
+    ]
+    assert noticed == noticed_turns
