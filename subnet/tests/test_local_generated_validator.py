@@ -33,7 +33,6 @@ def _pack(families: list[str]) -> SimpleNamespace:
         task_specs=[
             SimpleNamespace(
                 family=family,
-                family_payload={},
                 grading=SimpleNamespace(decoupled=True),
                 situation=SimpleNamespace(requirements=[], obligations=[], metrics=[]),
             )
@@ -120,7 +119,6 @@ def _install_runtime_fakes(
             "session_id": f"session-{index}",
             "policy_view": {
                 "query": family,
-                "tool_contract_version": "v1",
                 "tools": [],
                 "max_steps": 4,
                 "max_calls_per_turn": 16,
@@ -193,11 +191,7 @@ def test_local_pack_never_runs_race_rows_or_with_race_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     roster = ["composed"] * 5
-    race = _pack(roster)
-    race.task_specs[0].family_payload = {"world": {"regime": "race"}}
-    with pytest.raises(ValueError, match="race rows: task-0"):
-        validate_local_pack(race)
-    sealed = _pack(["composed"] * 5)
+    sealed = _pack(roster)
     sealed.task_specs[1].grading = SimpleNamespace(decoupled=False)
     with pytest.raises(ValueError, match="race rows: task-1"):
         validate_local_pack(sealed, frozenset({"composed"}))
@@ -446,8 +440,6 @@ def test_timeout_retries_container_removal_after_failed_forced_removal(
     monkeypatch: pytest.MonkeyPatch,
     loaded_pack,
 ) -> None:
-    from oro_env_runtime.runtime import TOOL_CONTRACT_VERSION
-
     from subnet.validator.session_registry import InvalidSessionError, SessionRegistry
 
     results = [
@@ -476,7 +468,6 @@ def test_timeout_retries_container_removal_after_failed_forced_removal(
             runtime.call(
                 {
                     "session_id": rows[0]["session_id"],
-                    "tool_contract_version": TOOL_CONTRACT_VERSION,
                     "call_id": "late",
                     "idempotency_key": "late",
                     "turn": 1,
@@ -1200,7 +1191,7 @@ def test_problem_execution_timeout_uses_one_budget_across_worker_batches(
     registry.start.side_effect = [
         {
             "session_id": f"session-{index}",
-            "policy_view": {"query": family, "tool_contract_version": "v1"},
+            "policy_view": {"query": family},
         }
         for index, family in enumerate(_ROSTER)
     ]

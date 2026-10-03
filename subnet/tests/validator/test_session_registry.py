@@ -12,7 +12,6 @@ from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
-from oro_env_runtime.runtime import TOOL_CONTRACT_VERSION
 from oro_env_runtime.schema import Event, LedgerEntry
 from validator.env_pack_loader import LoadedPack
 from validator.episode_emitter import replay_ledger
@@ -27,6 +26,8 @@ from validator.simulator_completion import (
     VALIDATOR_CALLER_SECRET,
     InferenceProviderError,
 )
+
+from tests.compat_fixture import accepted_ref
 
 pytest_plugins = ("tests.compat_fixture",)
 
@@ -69,7 +70,6 @@ def _call_envelope(
         "call_id": call_id,
         "idempotency_key": idempotency_key,
         "pack_sha256": registry.pack_sha256,
-        "tool_contract_version": TOOL_CONTRACT_VERSION,
         "turn": turn,
         "action": action or {"name": "inspect_cart", "args": {}},
     }
@@ -336,7 +336,6 @@ def test_fresh_sessions_are_isolated_and_hide_private_truth(
     assert set(first["policy_view"]) == {
         "query",
         "max_steps",
-        "tool_contract_version",
         "tools",
         "max_calls_per_turn",
     }
@@ -348,7 +347,7 @@ def test_fresh_sessions_are_isolated_and_hide_private_truth(
     second_state_hash = registry._sessions["session-2"].session.env.state_hash_now()
     assert first_state_hash == second_state_hash
     task = registry.loaded_pack.task_specs[0]
-    candidate = task.gold_set[0]
+    candidate = accepted_ref(task)
     changed = registry.call(
         _call_envelope(
             registry,
@@ -387,7 +386,6 @@ def test_forged_session_token_is_rejected(registry: SessionRegistry) -> None:
         ("agent_version_id", "other-agent"),
         ("task_id", "other-task"),
         ("pack_sha256", "0" * 64),
-        ("tool_contract_version", "other-tools"),
     ],
 )
 def test_call_must_match_full_session_binding(
@@ -397,6 +395,15 @@ def test_call_must_match_full_session_binding(
     envelope = {**_call_envelope(registry), field: value}
     with pytest.raises(InvalidSessionError, match=field):
         registry.call(envelope)
+
+
+def test_call_ignores_a_tool_contract_version_from_older_agents(
+    registry: SessionRegistry,
+) -> None:
+    _start(registry)
+    envelope = {**_call_envelope(registry), "tool_contract_version": "oro_task_tools_v6"}
+
+    assert registry.call(envelope)["observation"]["error"] is None
 
 
 def test_idempotency_is_serialized_and_call_ids_are_bound(
@@ -570,7 +577,7 @@ def test_grouped_calls_keep_order_ids_and_simulator_reply(
         state.session.env.applied_events.append(
             Event(
                 kind="price_change",
-                target=state.session.task.gold_set[0],
+                target=accepted_ref(state.session.task),
                 old_price=10.0,
                 new_price=12.0,
                 currency=state.session.task.hard.currency,
@@ -717,7 +724,7 @@ def test_terminal_call_allows_replay_but_rejects_new_turn(
     registry: SessionRegistry,
 ) -> None:
     _start(registry)
-    candidate = registry.loaded_pack.task_specs[0].gold_set[0]
+    candidate = accepted_ref(registry.loaded_pack.task_specs[0])
     registry.call(
         _call_envelope(
             registry,
@@ -804,7 +811,7 @@ def test_terminal_results_snapshot_does_not_finalize_registry(
     registry: SessionRegistry,
 ) -> None:
     _start(registry)
-    candidate = registry.loaded_pack.task_specs[0].gold_set[0]
+    candidate = accepted_ref(registry.loaded_pack.task_specs[0])
     registry.call(
         _call_envelope(
             registry,
