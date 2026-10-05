@@ -12,7 +12,6 @@ from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
-from oro_env_runtime.runtime import TOOL_CONTRACT_VERSION
 from oro_env_runtime.schema import Event, LedgerEntry
 from validator.env_pack_loader import LoadedPack
 from validator.episode_emitter import replay_ledger
@@ -23,6 +22,12 @@ from validator.session_registry import (
     SessionRegistry,
 )
 from validator.session_service import SessionRuntime, create_session_app
+from validator.simulator_completion import (
+    VALIDATOR_CALLER_SECRET,
+    InferenceProviderError,
+)
+
+from tests.compat_fixture import accepted_ref
 
 pytest_plugins = ("tests.compat_fixture",)
 
@@ -65,7 +70,6 @@ def _call_envelope(
         "call_id": call_id,
         "idempotency_key": idempotency_key,
         "pack_sha256": registry.pack_sha256,
-        "tool_contract_version": TOOL_CONTRACT_VERSION,
         "turn": turn,
         "action": action or {"name": "inspect_cart", "args": {}},
     }
@@ -169,7 +173,8 @@ def test_default_simulator_evidence_is_private_and_persisted(
         )
         traces = registry.finalized_results()[0]["call_trace"]
 
-    assert response["user_message"] == {"content": "my budget is at most 200.00 USD."}
+    # The reply is the task's own budget line (the compat fixture names each line by its key).
+    assert response["user_message"] == {"content": "budget 200.00 USD"}
     assert "simulator" not in response
     evidence = traces[0]["simulator"]
     assert evidence["latency_ms"] >= 0
@@ -188,6 +193,35 @@ def test_default_simulator_evidence_is_private_and_persisted(
     assert exchange["error"] is None
     assert "miner-token" not in json.dumps(traces)
     assert traces[1]["simulator"] is None
+
+
+def test_a_provider_error_body_never_reaches_the_agent(
+    loaded_pack: LoadedPack,
+) -> None:
+    """The provider's status and body stay in the validator's trace and result."""
+    body = "provider-body-marker"
+    with SessionRegistry(loaded_pack, inference_access_token="miner-token") as registry:
+        _start(registry)
+        state = registry._sessions["session-1"]
+        state.simulator = registry._default_simulator(state)
+        state.simulator._completion._client.post_verbose = MagicMock(
+            side_effect=InferenceProviderError(400, body)
+        )
+        envelope = _call_envelope(
+            registry, action={"name": "message", "args": {"content": "Any preference?"}}
+        )
+        with pytest.raises(HarnessExecutionError) as raised:
+            registry.call(envelope)
+        assert body not in str(raised.value)
+        with pytest.raises(InvalidSessionError) as again:
+            registry.call(
+                _call_envelope(
+                    registry, call_id="call-2", idempotency_key="idem-2", turn=2
+                )
+            )
+        assert body not in str(again.value)
+        result = registry.finalized_results()[0]
+    assert body in result["error_detail"]
 
 
 def test_default_simulator_failure_is_an_environment_error(
@@ -211,7 +245,7 @@ def test_default_simulator_failure_is_an_environment_error(
             side_effect=RuntimeError(private_detail)
         )
         with pytest.raises(
-            HarnessExecutionError, match="user simulator failed: RuntimeError"
+            HarnessExecutionError, match="^user simulator failed; session quarantined$"
         ):
             registry.call(
                 _call_envelope(
@@ -272,7 +306,9 @@ def test_miner_key_exhaustion_is_agent_error_and_stops_run(
         result = registry.finalized_results()[0]
         assert registry.key_exhausted.is_set()
 
-    assert post.call_count == 1
+    # The disclosure reader's read fails first (no reveal); the simulator's own call then
+    # surfaces the exhausted key.
+    assert post.call_count == 2
     assert result["outcome"] == "agent_error"
     assert result["environment_error"] is False
     assert result["error_detail"] == "user simulator failed: miner inference key exhausted"
@@ -301,7 +337,6 @@ def test_fresh_sessions_are_isolated_and_hide_private_truth(
     assert set(first["policy_view"]) == {
         "query",
         "max_steps",
-        "tool_contract_version",
         "tools",
         "max_calls_per_turn",
     }
@@ -313,7 +348,7 @@ def test_fresh_sessions_are_isolated_and_hide_private_truth(
     second_state_hash = registry._sessions["session-2"].session.env.state_hash_now()
     assert first_state_hash == second_state_hash
     task = registry.loaded_pack.task_specs[0]
-    candidate = task.gold_set[0]
+    candidate = accepted_ref(task)
     changed = registry.call(
         _call_envelope(
             registry,
@@ -352,7 +387,6 @@ def test_forged_session_token_is_rejected(registry: SessionRegistry) -> None:
         ("agent_version_id", "other-agent"),
         ("task_id", "other-task"),
         ("pack_sha256", "0" * 64),
-        ("tool_contract_version", "other-tools"),
     ],
 )
 def test_call_must_match_full_session_binding(
@@ -362,6 +396,15 @@ def test_call_must_match_full_session_binding(
     envelope = {**_call_envelope(registry), field: value}
     with pytest.raises(InvalidSessionError, match=field):
         registry.call(envelope)
+
+
+def test_call_ignores_a_tool_contract_version_from_older_agents(
+    registry: SessionRegistry,
+) -> None:
+    _start(registry)
+    envelope = {**_call_envelope(registry), "tool_contract_version": "oro_task_tools_v6"}
+
+    assert registry.call(envelope)["observation"]["error"] is None
 
 
 def test_idempotency_is_serialized_and_call_ids_are_bound(
@@ -535,13 +578,13 @@ def test_grouped_calls_keep_order_ids_and_simulator_reply(
         state.session.env.applied_events.append(
             Event(
                 kind="price_change",
-                target=state.session.task.gold_set[0],
+                target=accepted_ref(state.session.task),
                 old_price=10.0,
                 new_price=12.0,
                 currency=state.session.task.hard.currency,
             )
         )
-        state.event_fired_turn = 1
+        state.event_fired_turns[0] = 1
         event_response = registry.call(
             _call_envelope(
                 registry,
@@ -682,7 +725,7 @@ def test_terminal_call_allows_replay_but_rejects_new_turn(
     registry: SessionRegistry,
 ) -> None:
     _start(registry)
-    candidate = registry.loaded_pack.task_specs[0].gold_set[0]
+    candidate = accepted_ref(registry.loaded_pack.task_specs[0])
     registry.call(
         _call_envelope(
             registry,
@@ -769,7 +812,7 @@ def test_terminal_results_snapshot_does_not_finalize_registry(
     registry: SessionRegistry,
 ) -> None:
     _start(registry)
-    candidate = registry.loaded_pack.task_specs[0].gold_set[0]
+    candidate = accepted_ref(registry.loaded_pack.task_specs[0])
     registry.call(
         _call_envelope(
             registry,
@@ -1077,6 +1120,20 @@ def test_inference_key_is_bound_to_active_run() -> None:
     assert response.status_code == 204
     assert response.headers["X-ORO-Run-ID"] == "run-1"
     assert "sk-or-expected" not in str(response.headers)
+    # The key alone (the agent's) reads as the agent; only the validator's own secret,
+    # which never leaves its process, reads as the validator.
+    assert response.headers["X-ORO-Caller"] == "agent"
+    forged = client.get(url, headers={**valid, "X-ORO-Validator": "guess"})
+    assert forged.headers["X-ORO-Caller"] == "agent"
+    own = client.get(url, headers={**valid, "X-ORO-Validator": VALIDATOR_CALLER_SECRET})
+    assert own.headers["X-ORO-Caller"] == "validator"
+    assert VALIDATOR_CALLER_SECRET not in str(own.headers)
+    # A non-ASCII header is a mismatch, not a server error.
+    odd = "é".encode("latin-1")
+    assert client.get(url, headers={"Authorization": b"Bearer " + odd}).status_code == 401
+    assert client.get(url, headers={**valid, "X-ORO-Validator": odd}).headers[
+        "X-ORO-Caller"
+    ] == "agent"
 
     runtime.set_inference_grant("run-1", "sk-or-expected", 0)
     assert client.get(url, headers=valid).status_code == 401
