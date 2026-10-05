@@ -44,7 +44,12 @@ shopper reveals other needs only when asked through the `message` tool; the
 shopper or the market (price, stock) can change during the task; and some tasks
 require something of the process, such as answering the shopper's question or
 backing the order with grounded claims when the shopper asks for a reason. An
-order that misses any requirement or obligation scores 0. A passing order earns
+order that misses any requirement or obligation scores 0. When no listing meets
+every requirement, the task ends with `place_test_order` and `abstain: true`
+instead: nothing is ordered, `product_id`/`sku` name the closest alternative,
+and the justification claims state the facts that show why it falls short.
+Ordering on such a task, or abstaining when a listing fits, scores 0. A
+passing order earns
 up to 1.0, less for questions beyond what the order needed and for a
 less-than-best pick by the shopper's stated priority. On the network, each
 episode's feedback names one failure category (below), never the individual
@@ -138,7 +143,7 @@ parentheses:
 
 ```text
 ORO Bench local run  local-7c1f2a
-  pack        90169a07…a7e8
+  pack        f75b76c8…cd0c
   problems    5 of 30, qualifying roster
   runtime     0.3.4
   inference   openrouter
@@ -148,14 +153,14 @@ ORO Bench local run  local-7c1f2a
   simulator   mistralai/mistral-small-2603
   judge       deepseek/deepseek-v4-flash-0731
 
-composed               mean 0.34  2/5 passed
-  TF8-composed-700000  completed         1.00
-  TF8-composed-700001  completed         0.70  extra_questions (extra_questions)
-  TF8-composed-700016  completed         0.00  request_not_met (request_not_met, needs_not_found, changes_missed, process_issue)
-  TF8-composed-700018  completed         0.00  needs_not_found (needs_not_found)
-  TF8-composed-700030  completed         0.00  did_not_finish (did_not_finish)
+composed               mean 0.12  1/5 passed
+  TF8-composed-700000  completed         0.60  extra_questions (extra_questions)
+  TF8-composed-700001  completed         0.00  needs_not_found (needs_not_found)
+  TF8-composed-700015  completed         0.00  request_not_met (request_not_met, needs_not_found)
+  TF8-composed-700016  completed         0.00  did_not_finish (did_not_finish)
+  TF8-composed-700023  completed         0.00  request_not_met (request_not_met, needs_not_found, process_issue)
 
-Aggregate score  0.340000
+Aggregate score  0.120000
 Artifacts        logs/environment-runs/local-7c1f2a
 Trajectories     logs/environment-runs/local-7c1f2a/trajectories.html  (open in a browser)
 ```
