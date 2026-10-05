@@ -1268,41 +1268,21 @@ wheels = [
 
 [[package]]
 name = "oro-env-runtime"
-version = "1.0.6"
+version = "3.3.0"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "sys_platform != 'darwin'",
-    "sys_platform == 'darwin'",
-]
 dependencies = [
+    { name = "httpx" },
     { name = "iso4217" },
     { name = "openai" },
     { name = "pydantic" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b9/a5/000423509c7436449b59abaf343bb42d36db2114c5578221db8dd683aabd/oro_env_runtime-1.0.6-py3-none-any.whl", hash = "sha256:f572e92cca21cf592fd7f43a82c17b8bdde6df8059e645271610e23b676046fb", size = 178728, upload-time = "2026-09-15T05:18:00.479Z" },
-]
-
-[[package]]
-name = "oro-env-runtime"
-version = "2.0.1"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "sys_platform != 'darwin'",
-    "sys_platform == 'darwin'",
-]
-dependencies = [
-    { name = "iso4217" },
-    { name = "openai" },
-    { name = "pydantic" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ad/e5/bd444245f1d3dbadb117327c3bd984032cb72578ab3c5ab97326bc5ad6f7/oro_env_runtime-2.0.1-py3-none-any.whl", hash = "sha256:fc8ff284860fb8b2fd80cd58edc735489297472564b29b5976f4f0f65bfa18f5", size = 156758, upload-time = "2026-09-20T18:37:36.234Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/e6/20bb0804065242b5274e69ef5a07b28dce851eb8ef0f45fe7dc0bdfd231d/oro_env_runtime-3.3.0-py3-none-any.whl", hash = "sha256:c38917bac9ff30aaaff0755e5150f21f3d3c66a891cbdbe7f06644b3fe291404", size = 69272, upload-time = "2026-10-05T01:20:44.463Z" },
 ]
 
 [[package]]
 name = "oro-sdk"
-version = "1.0.121"
+version = "4.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "attrs" },
@@ -1310,9 +1290,9 @@ dependencies = [
     { name = "httpx" },
     { name = "python-dateutil" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ce/8d/723f58d2d0740b8eb64736ea657b8bd65edfc89b41d4ba1cb7a9d9619bf6/oro_sdk-1.0.121.tar.gz", hash = "sha256:513b10bef0d854a4da5896c45cba11dd0449ac8e26ccd6b24d94b0df27c731bd", size = 169224, upload-time = "2026-09-14T03:52:43.465Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/56/47/b00390b3c9ad9ee9f44b61546d64bdf8fbb419f278eb9ca59cda33ce3d27/oro_sdk-4.0.0.tar.gz", hash = "sha256:2147dda54b54006197596763320592a70f5b190d734c7ff5419d5a92b129fd3b", size = 178181, upload-time = "2026-10-03T07:35:02.556Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/17/8c/bdf0f693b25d97808746bed6f7f5631dbdb53912b9b69786083325af8177/oro_sdk-1.0.121-py3-none-any.whl", hash = "sha256:65f7bfbd9a6222527cc727afe8f79b75dde0e81078a81e7ccc16b23bcb78affa", size = 410809, upload-time = "2026-09-14T03:52:42.367Z" },
+    { url = "https://files.pythonhosted.org/packages/55/36/b143c2e91a5bf1c47378cbd9a4bd69dbd6f4695a7b2cb29f164d09a7dde4/oro_sdk-4.0.0-py3-none-any.whl", hash = "sha256:0c3a63644064678edf9d9be2450ab8ffded5ddd7f97c8a852a9aca153fc077b4", size = 423727, upload-time = "2026-10-03T07:35:00.541Z" },
 ]
 
 [[package]]
@@ -1342,10 +1322,10 @@ dependencies = [
 
 [package.dev-dependencies]
 local-test = [
-    { name = "oro-env-runtime", version = "1.0.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "oro-env-runtime" },
 ]
 validator = [
-    { name = "oro-env-runtime", version = "2.0.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "oro-env-runtime" },
 ]
 
 [package.metadata]
@@ -1356,7 +1336,7 @@ requires-dist = [
     { name = "bittensor-wallet", specifier = "==4.1.0" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "openai", specifier = "==2.44.0" },
-    { name = "oro-sdk", specifier = "==1.0.121" },
+    { name = "oro-sdk", specifier = "==4.0.0" },
     { name = "prometheus-client", specifier = ">=0.20.0" },
     { name = "psutil", specifier = ">=5.9.0" },
     { name = "py-spy", specifier = ">=0.4.1" },
@@ -1370,8 +1350,8 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-local-test = [{ name = "oro-env-runtime", specifier = "==1.0.6" }]
-validator = [{ name = "oro-env-runtime", specifier = "==2.0.1" }]
+local-test = [{ name = "oro-env-runtime", specifier = "==3.3.0" }]
+validator = [{ name = "oro-env-runtime", specifier = "==3.3.0" }]
 
 [[package]]
 name = "packaging"
