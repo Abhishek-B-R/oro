@@ -8,11 +8,14 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
+from oro_env_runtime import loop
 from oro_env_runtime.schema import Event, LedgerEntry
+from oro_env_runtime.situation import Reader
+from src.agent.proxy_client import ProxyClient
 from validator.env_pack_loader import LoadedPack
 from validator.episode_emitter import replay_ledger
 from validator.session_registry import (
@@ -25,6 +28,7 @@ from validator.session_service import SessionRuntime, create_session_app
 from validator.simulator_completion import (
     VALIDATOR_CALLER_SECRET,
     InferenceProviderError,
+    SimulatorCompletion,
 )
 
 from tests.compat_fixture import accepted_ref
@@ -135,14 +139,14 @@ def test_default_simulator_evidence_is_private_and_persisted(
         inference_access_token="miner-token",
     ) as registry:
         _start(registry)
-        # SimulatorCompletion switched to ``post_verbose`` (ORO-2191);
+        # SimulatorCompletion uses the awaitable request-local result;
         # patch the new method with a ``PostResult(data=..., error=None)``
         # equivalent of the old success shape.
         from src.agent.proxy_client import PostResult
 
         state = registry._sessions["session-1"]
         state.simulator = registry._default_simulator(state)
-        state.simulator._completion._client.post_verbose = MagicMock(
+        state.simulator._completion._client.post_verbose_async = AsyncMock(
             return_value=PostResult(
                 data={
                     "choices": [
@@ -195,6 +199,122 @@ def test_default_simulator_evidence_is_private_and_persisted(
     assert traces[1]["simulator"] is None
 
 
+@pytest.fixture
+def reader_pack(loaded_pack: LoadedPack) -> LoadedPack:
+    task = loaded_pack.task_specs[0]
+    reader = Reader(
+        model="test/reader", instructions="Answer the supplied test questions.", state={},
+        questions={key: "Is this eligible?" for key in (
+            "all", "asks", *(f"facet:{facet.id}" for facet in task.situation.facets)
+        )},
+    )
+    loaded_pack.task_specs[0] = task.model_copy(update={
+        "situation": task.situation.model_copy(update={"reader": reader}),
+    })
+    return loaded_pack
+
+
+@pytest.mark.parametrize("miner", ["sk-or-miner", "cak_miner"])
+def test_reader_uses_miner_for_every_simulator_role_and_budget_exhaustion_is_agent_error(
+    reader_pack: LoadedPack, miner: str,
+) -> None:
+    with SessionRegistry(reader_pack, inference_access_token=miner) as registry:
+        _start(registry)
+        state = registry._sessions["session-1"]
+        state.session.task = reader_pack.task_specs[0]
+        simulator = registry._default_simulator(state)
+        assert simulator._completion._client.api_key == miner
+        assert simulator._discloser.reader_judges[0]._complete.func is simulator._completion
+        assert simulator._completion._client.headers["X-ORO-Validator"] == VALIDATOR_CALLER_SECRET
+        assert callable(simulator._completion.decide) == miner.startswith("sk-or-")
+        simulator.respond = AsyncMock(side_effect=InferenceProviderError(403, "Key limit exceeded"))
+        state.simulator = simulator
+        runtime = SessionRuntime()
+        runtime.install(registry)
+        response = TestClient(create_session_app(runtime)).post(
+            "/v1/session/call", json=_call_envelope(
+                registry, action={"name": "message", "args": {"content": "A test question?"}},
+            ),
+        )
+        assert response.status_code == 402
+        assert "Key limit" not in response.text
+        assert registry.key_exhausted.is_set()
+        result = registry.finalized_results()[0]
+        assert result["outcome"] == "agent_error"
+        assert result["environment_error"] is False
+
+
+@pytest.mark.parametrize("status,body,http_status", [
+    (403, "Key limit exceeded", 402), (400, "provider failure", 500),
+])
+def test_real_reader_classifies_budget_and_infrastructure_failures(
+    reader_pack, monkeypatch, status, body, http_status,
+) -> None:
+    from src.agent.proxy_client import PostResult
+
+    monkeypatch.setattr("validator.simulator_completion._MAX_ATTEMPTS", 1)
+    with SessionRegistry(reader_pack, inference_access_token="sk-or-miner") as registry:
+        _start(registry)
+        state = registry._sessions["session-1"]
+        state.session.task = reader_pack.task_specs[0]
+        state.simulator = registry._default_simulator(state)
+        state.simulator._completion._client.post_verbose_async = AsyncMock(return_value=PostResult(
+            data=None, error={"kind": "http", "status": status, "body": body},
+        ))
+        runtime = SessionRuntime()
+        runtime.install(registry)
+        response = TestClient(create_session_app(runtime)).post(
+            "/v1/session/call", json=_call_envelope(
+                registry, action={"name": "message", "args": {"content": "A test question?"}},
+            ),
+        )
+        assert response.status_code == http_status
+        assert response.json()["detail"]["environment_error"] is (http_status == 500)
+        assert registry.key_exhausted.is_set() is (http_status == 402)
+        assert registry.finalized_results()[0]["outcome"] == (
+            "agent_error" if http_status == 402 else "environment_error"
+        )
+        assert state.simulator._completion._client.post_verbose_async.call_count == 1
+
+
+@pytest.mark.parametrize("exhausted,http_status", [(True, 402), (False, 504)])
+def test_reader_timeout_preserves_miner_budget_classification(reader_pack, exhausted, http_status):
+    from validator.generated_evaluation import aggregate_results
+
+    with SessionRegistry(reader_pack, inference_access_token="sk-or-miner", simulator_timeout_s=0.25) as registry:
+        _start(registry)
+        state = registry._sessions["session-1"]
+        state.session.task = reader_pack.task_specs[0]
+        state.simulator = registry._default_simulator(state)
+
+        async def stalled_reader(*args, **kwargs):
+            assert kwargs["json_data"]["model"] == "test/reader"
+            if exhausted:
+                registry.key_exhausted.set()
+            await asyncio.sleep(60)
+
+        state.simulator._completion._client.post_verbose_async = stalled_reader
+        runtime = SessionRuntime()
+        runtime.install(registry)
+        response = TestClient(create_session_app(runtime)).post(
+            "/v1/session/call", json=_call_envelope(
+                registry, action={"name": "message", "args": {"content": "A test question?"}},
+            ),
+        )
+        assert response.status_code == http_status
+        result = registry.finalized_results()[0]
+        assert result["environment_error"] is not exhausted
+        assert result["outcome"] == ("agent_error" if exhausted else "environment_error")
+        assert result["call_trace"][0]["error"]["type"] == (
+            "AgentInferenceBudgetError" if exhausted else "HarnessTimeoutError"
+        )
+        if exhausted:
+            assert aggregate_results([result], selected_reader_task_ids={result["task_id"]}) == 0.0
+        else:
+            with pytest.raises(ValueError, match="infrastructure failure"):
+                aggregate_results([result], selected_reader_task_ids={result["task_id"]})
+
+
 def test_a_provider_error_body_never_reaches_the_agent(
     loaded_pack: LoadedPack,
 ) -> None:
@@ -204,7 +324,7 @@ def test_a_provider_error_body_never_reaches_the_agent(
         _start(registry)
         state = registry._sessions["session-1"]
         state.simulator = registry._default_simulator(state)
-        state.simulator._completion._client.post_verbose = MagicMock(
+        state.simulator._completion._client.post_verbose_async = AsyncMock(
             side_effect=InferenceProviderError(400, body)
         )
         envelope = _call_envelope(
@@ -233,7 +353,7 @@ def test_default_simulator_failure_is_an_environment_error(
         inference_access_token="miner-token",
     ) as registry:
         _start(registry)
-        # SimulatorCompletion now calls ``post_verbose``; a bug/misuse in the
+        # SimulatorCompletion now calls ``post_verbose_async``; a bug/misuse in the
         # completion client that raises an arbitrary ``RuntimeError`` (as
         # opposed to returning a ``PostResult`` with an error dict) must NOT
         # leak the exception's private message into the ledger. Only the
@@ -241,7 +361,7 @@ def test_default_simulator_failure_is_an_environment_error(
         # through ``InferenceProviderError`` instead (ORO-2191).
         state = registry._sessions["session-1"]
         state.simulator = registry._default_simulator(state)
-        state.simulator._completion._client.post_verbose = MagicMock(
+        state.simulator._completion._client.post_verbose_async = AsyncMock(
             side_effect=RuntimeError(private_detail)
         )
         with pytest.raises(
@@ -276,7 +396,7 @@ def test_miner_key_exhaustion_is_agent_error_and_stops_run(
         _start(registry)
         state = registry._sessions["session-1"]
         state.simulator = registry._default_simulator(state)
-        post = MagicMock(
+        post = AsyncMock(
             return_value=PostResult(
                 data=None,
                 error={
@@ -286,7 +406,7 @@ def test_miner_key_exhaustion_is_agent_error_and_stops_run(
                 },
             )
         )
-        state.simulator._completion._client.post_verbose = post
+        state.simulator._completion._client.post_verbose_async = post
         with pytest.raises(HarnessExecutionError, match="miner inference key exhausted"):
             registry.call(
                 _call_envelope(
@@ -698,6 +818,162 @@ def test_simulator_timeout_is_independent_of_the_tool_timeout(
         assert timing["total"] >= timing["simulator"]
         with pytest.raises(InvalidSessionError, match="quarantined"):
             registry.verdict(envelope)
+
+
+def test_registry_timeout_closes_http_request_and_releases_worker(
+    loaded_pack: LoadedPack, tmp_path, monkeypatch
+) -> None:
+    log_path = tmp_path / "requests.jsonl"
+    monkeypatch.setenv("REQUEST_LOG_FILE", str(log_path))
+
+    async def exercise() -> None:
+        started, closed = asyncio.Event(), asyncio.Event()
+
+        async def handle(reader, writer):
+            try:
+                headers = await reader.readuntil(b"\r\n\r\n")
+                length = next(
+                    int(header.split(b":", 1)[1])
+                    for header in headers.split(b"\r\n")
+                    if header.lower().startswith(b"content-length:")
+                )
+                await reader.readexactly(length)
+                started.set()
+                assert await reader.read() == b""
+                closed.set()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        async with await asyncio.start_server(handle, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            complete = SimulatorCompletion(
+                "test-token",
+                client=ProxyClient(
+                    proxy_url=f"http://127.0.0.1:{port}",
+                    api_key="test-token",
+                    timeout=5,
+                    max_retries=1,
+                ),
+            )
+
+            class Simulator:
+                def exchange_trace(self):
+                    return [{"kind": "completed_reader", "answer": "unsure"}]
+
+                async def respond(self, _transcript, _signal):
+                    await complete("test-model", [])
+                    raise AssertionError("timed-out response must not return")
+
+            with SessionRegistry(
+                loaded_pack,
+                simulator_timeout_s=0.5,
+                max_workers=1,
+                simulator_factory=lambda _session: Simulator(),
+            ) as registry:
+                _start(registry)
+                envelope = _call_envelope(
+                    registry,
+                    action={"name": "message", "args": {"content": "A question?"}},
+                )
+                call = asyncio.create_task(asyncio.to_thread(registry.call, envelope))
+                await asyncio.wait_for(started.wait(), 2)
+                with pytest.raises(HarnessTimeoutError, match="simulator call exceeded"):
+                    await call
+                await asyncio.wait_for(closed.wait(), 1)
+                # The only worker can accept work after the socket has closed.
+                assert await asyncio.wait_for(
+                    asyncio.wrap_future(registry._executor.submit(lambda: "available")), 1
+                ) == "available"
+                with pytest.raises(InvalidSessionError, match="quarantined"):
+                    registry.verdict(envelope)
+                assert registry.finalized_results()[0]["call_trace"][0]["simulator"]["exchanges"] == [
+                    {"kind": "completed_reader", "answer": "unsure"}
+                ]
+
+    asyncio.run(asyncio.wait_for(exercise(), 4))
+    summaries = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert [entry["response"] for entry in summaries if entry["kind"] == "summary"] == [
+        {"kind": "cancelled", "usage": "unknown"}
+    ]
+
+
+def test_simulator_phases_share_one_deadline(loaded_pack: LoadedPack, monkeypatch) -> None:
+    completed, cancelled = [], threading.Event()
+
+    async def phase(name):
+        try:
+            await asyncio.sleep(0.08)
+            completed.append(name)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    with SessionRegistry(loaded_pack, simulator_timeout_s=0.12, max_workers=1) as registry:
+        _start(registry)
+
+        def two_phases(*_args):
+            registry._run_simulator(phase("response"))
+            registry._run_simulator(phase("reword"))
+            return []
+
+        monkeypatch.setattr(registry, "_shopper_turn_decisions", two_phases)
+        with pytest.raises(HarnessTimeoutError, match="simulator call exceeded"):
+            registry.call(_call_envelope(
+                registry,
+                action={"name": "message", "args": {"content": "A question?"}},
+            ))
+        assert cancelled.wait(timeout=1)
+        assert completed == ["response"]
+        assert registry._executor.submit(lambda: "available").result(timeout=1) == "available"
+
+
+def test_response_and_next_boundary_reword_share_deadline(
+    loaded_pack: LoadedPack, monkeypatch
+) -> None:
+    completed, cancelled = [], threading.Event()
+
+    class Simulator:
+        async def respond(self, _transcript, _signal):
+            await asyncio.sleep(0.15)
+            completed.append("response")
+            return {"action": "clarify", "content": "reply", "reason": "spoke"}
+
+    async def reword(_simulator, _session):
+        try:
+            await asyncio.sleep(0.15)
+            completed.append("reword")
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    with SessionRegistry(
+        loaded_pack,
+        simulator_timeout_s=0.25,
+        max_workers=1,
+        simulator_factory=lambda _session: Simulator(),
+    ) as registry:
+        _start(registry)
+        env = registry._sessions["session-1"].session.env
+        begin_turn = env.begin_solver_turn
+
+        def queue_next_line(turn):
+            begin_turn(turn)
+            if turn == 2:
+                env.utterances.append(("test-line", "next turn line"))
+
+        monkeypatch.setattr(env, "begin_solver_turn", queue_next_line)
+        monkeypatch.setattr(loop, "reword_utterances", reword)
+        with pytest.raises(HarnessTimeoutError, match="simulator call exceeded"):
+            registry.call(_call_envelope(
+                registry,
+                action={"name": "message", "args": {"content": "A question?"}},
+            ))
+        assert cancelled.wait(timeout=1)
+        assert completed == ["response"]
+        assert registry._executor.submit(lambda: "available").result(timeout=1) == "available"
+        timing = registry.finalized_results()[0]["call_trace"][0]["timing_ms"]
+        assert timing["simulator"] >= 240  # both phases, excluding boundary bookkeeping
 
 
 def test_grouped_calls_reject_more_than_the_declared_limit(
@@ -1152,3 +1428,24 @@ def test_runtime_replacement_closes_the_previous_pack_generation() -> None:
 
     first.close.assert_called_once_with()
     second.close.assert_called_once_with()
+
+
+def test_validator_caller_cannot_authorize_a_different_account() -> None:
+    runtime = SessionRuntime()
+    client = TestClient(create_session_app(runtime))
+    url = "/v1/inference/authorize"
+    runtime.set_inference_grant("run", "cak_miner", time.time() + 60)
+    for caller in (None, "guess", VALIDATOR_CALLER_SECRET):
+        headers = {"Authorization": "Bearer sk-or-other"}
+        if caller is not None:
+            headers["X-ORO-Validator"] = caller
+        assert client.get(url, headers=headers).status_code == 401
+    response = client.get(url, headers={
+        "Authorization": "Bearer cak_miner", "X-ORO-Validator": VALIDATOR_CALLER_SECRET,
+    })
+    assert response.status_code == 204
+    assert response.headers["X-ORO-Caller"] == "validator"
+    runtime.set_inference_grant("run", "cak_miner", 0)
+    assert client.get(url, headers={"Authorization": "Bearer cak_miner"}).status_code == 401
+    runtime.clear_inference_grant()
+    assert client.get(url, headers={"Authorization": "Bearer cak_miner"}).status_code == 401

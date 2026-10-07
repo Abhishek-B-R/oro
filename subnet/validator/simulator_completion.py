@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import threading
 import time
 from typing import Any
 
@@ -76,9 +77,12 @@ class SimulatorCompletion:
         client: ProxyClient | None = None,
         inference_stats_file: str | None = None,
         episode_id: str | None = None,
+        key_exhausted_event: threading.Event | None = None,
     ) -> None:
         if not access_token:
-            raise ValueError("miner inference access token is required")
+            raise ValueError("inference access token is required")
+        self._access_token = access_token
+        self._key_exhausted_event = key_exhausted_event
         # Only OpenRouter serves the decisions endpoint (Jev). On another provider
         # the disclosure reader sees no ``decide`` and reads with the chat model;
         # a decisions error there would otherwise count as an answer (no reveal).
@@ -101,6 +105,8 @@ class SimulatorCompletion:
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 8192,
         temperature: float | None = 0.0,
+        reasoning: bool | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         request: dict[str, Any] = {
             "model": model,
@@ -112,15 +118,28 @@ class SimulatorCompletion:
             request["temperature"] = temperature
         if tools:
             request["tools"] = tools
+        if reasoning is not None:
+            request["reasoning"] = (
+                reasoning if isinstance(reasoning, dict) else {"enabled": reasoning}
+            )
+            if not self._access_token.startswith("sk-or-"):
+                preference = request["reasoning"]
+                if model != "Qwen/Qwen3.5-397B-A17B-TEE" or preference.get("enabled") is not False or len(preference) != 1:
+                    raise ValueError("Unsupported simulator reasoning preference for Chutes")
+                # Chutes' Qwen non-thinking mode uses the vLLM template switch.
+                request["chat_template_kwargs"] = {"enable_thinking": False}
+                del request["reasoning"]
+        if response_format is not None:
+            request["response_format"] = response_format
 
-        # Use ``post_verbose`` — its return value carries the upstream
+        # Use ``post_verbose_async`` — its return value carries the upstream
         # status+body directly. Callers must not rely on a shared client
         # attribute (see ORO-2191 review): a single ProxyClient shared by
         # concurrent sessions would let session B's failure overwrite
         # session A's just before A reads it, corrupting A's ledger.
         started = time.monotonic()
         for attempt in range(1, _MAX_ATTEMPTS + 1):
-            result = self._client.post_verbose(
+            result = await self._client.post_verbose_async(
                 "/inference/chat/completions",
                 json_data=request,
             )
@@ -136,7 +155,7 @@ class SimulatorCompletion:
                         _MAX_ATTEMPTS,
                     )
                 return {
-                    "text": message.get("content") or "",
+                    "text": (message.get("content") or "").replace(self._access_token, "[REDACTED]"),
                     "tool_calls": message.get("tool_calls") or [],
                     "finish_reason": choice.get("finish_reason"),
                 }
@@ -148,7 +167,7 @@ class SimulatorCompletion:
             error = result.error or {}
             kind = error.get("kind", "unknown")
             upstream_status = error.get("status")
-            upstream_body = (error.get("body") or "").strip()
+            upstream_body = (error.get("body") or "").strip().replace(self._access_token, "[REDACTED]")
             if data is None and result.error is None:
                 # ProxyClient returned no data but no error info — treat as
                 # a malformed 200 body (see ORO-2191 non-blocker: a JSON
@@ -166,7 +185,9 @@ class SimulatorCompletion:
             )
             provider_error = InferenceProviderError(upstream_status, upstream_body)
             if provider_error.key_exhausted:
-                logger.warning("miner inference key budget exhausted during user simulation")
+                if self._key_exhausted_event is not None:
+                    self._key_exhausted_event.set()
+                logger.warning("inference key budget exhausted during user simulation")
                 raise provider_error
             if attempt >= _MAX_ATTEMPTS:
                 logger.error(
@@ -207,20 +228,22 @@ class SimulatorCompletion:
         One attempt: the disclosure reader falls back to the chat model when
         this raises, so a retry here would only spend the simulator's budget.
         """
-        result = self._client.post_verbose(
+        result = await self._client.post_verbose_async(
             "/inference/alpha/decisions",
             json_data={"model": model, "state": state, "questions": questions},
         )
         if isinstance(result.data, dict):
             return result.data
         error = result.error or {}
+        body = (error.get("body") or "").strip().replace(self._access_token, "[REDACTED]")
         # No response is the one failure the reader treats as an outage (the fallback
         # reads); a status outside 429/502-504 or a malformed answer reads as unsure.
         if error.get("kind") == "network":
-            raise ConnectionError(error.get("body") or "no response")
-        raise InferenceProviderError(
-            error.get("status"), (error.get("body") or "").strip()
-        )
+            raise ConnectionError(body or "no response")
+        provider_error = InferenceProviderError(error.get("status"), body)
+        if provider_error.key_exhausted and self._key_exhausted_event is not None:
+            self._key_exhausted_event.set()
+        raise provider_error
 
 
 __all__ = ["InferenceProviderError", "SimulatorCompletion"]

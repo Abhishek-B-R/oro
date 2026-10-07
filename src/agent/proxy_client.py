@@ -1,5 +1,6 @@
 """HTTP proxy client for ShoppingBench services."""
 
+import asyncio
 import json
 import logging
 import math
@@ -497,34 +498,7 @@ class ProxyClient:
 
     def post(self, path: str, json_data: Optional[Dict] = None) -> Optional[Dict]:
         """Make a POST request to the proxy."""
-        url = self._build_url(path)
-        headers: Dict[str, str] = dict(self.headers)
-        if self.api_key and "/inference/" in path:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        def make_request():
-            response = requests.post(
-                url, json=json_data, headers=headers, timeout=self.timeout
-            )
-            if response.status_code == 404:
-                logger.error(f"Resource not found: {path}")
-            return response
-
-        t0 = time.monotonic()
-        response, result = self._make_request_with_retries(make_request, "POST", path)
-        duration_ms = (time.monotonic() - t0) * 1000
-
-        self._record_inference_result(path, result, json_data)
-
-        self.request_log.record(
-            method="POST",
-            path=path,
-            json_data=json_data,
-            status_code=response.status_code if response is not None else None,
-            response_body=result if result is not None else self._full_error(response),
-            duration_ms=duration_ms,
-        )
-        return result
+        return self.post_verbose(path, json_data).data
 
     def post_verbose(self, path: str, json_data: Optional[Dict] = None) -> "PostResult":
         """POST returning both the parsed JSON on success AND the upstream
@@ -570,6 +544,70 @@ class ProxyClient:
             status_code=response.status_code if response is not None else None,
             response_body=data if data is not None else self._full_error(response),
             duration_ms=duration_ms,
+        )
+        return PostResult(data=data, error=error)
+
+    async def post_verbose_async(
+        self, path: str, json_data: Optional[Dict] = None
+    ) -> "PostResult":
+        """Cancellable POST with the same outcomes and accounting as post_verbose.
+
+        Own the HTTP client inside this call: simulator turns use separate event loops.
+        Cancellation is recorded separately from provider failure; upstream usage is unknown.
+        """
+        import httpx
+
+        headers = dict(self.headers)
+        if self.api_key and "/inference/" in path:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        started = time.monotonic()
+        response, data = None, None
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+                for attempt in range(self.max_retries):
+                    attempt_started = time.monotonic()
+                    status_code, error_class = None, None
+                    try:
+                        response = await client.post(self._build_url(path), json=json_data, headers=headers)
+                        status_code = response.status_code
+                        if status_code == 200:
+                            try:
+                                data = response.json()
+                            except ValueError:
+                                error_class = "InvalidJSONBody"
+                            else:
+                                break
+                    except httpx.RequestError as exc:
+                        response = None
+                        error_class = type(exc).__name__
+                    except asyncio.CancelledError:
+                        error_class = "CancelledError"
+                        raise
+                    finally:
+                        self.request_log.record_attempt(
+                            "POST", path, attempt, (time.monotonic() - attempt_started) * 1000,
+                            status_code=status_code, error_class=error_class,
+                        )
+                    logger.warning("POST %s attempt %d/%d failed (status=%s error=%s)",
+                                   path, attempt + 1, self.max_retries, status_code, error_class)
+                    if attempt < self.max_retries - 1:
+                        base = self.rate_limit_retry_delay if status_code == 429 else self.retry_delay
+                        await asyncio.sleep(min(base * (2**attempt), 10))
+        except asyncio.CancelledError:
+            logger.info("POST %s cancelled; upstream usage unknown", path)
+            self.request_log.record(
+                "POST", path, json_data=json_data,
+                response_body={"kind": "cancelled", "usage": "unknown"},
+                duration_ms=(time.monotonic() - started) * 1000,
+            )
+            raise
+        self._record_inference_result(path, data, json_data)
+        error = self._describe_error(response) if data is None else None
+        self.request_log.record(
+            "POST", path, json_data=json_data,
+            status_code=response.status_code if response is not None else None,
+            response_body=data if data is not None else self._full_error(response),
+            duration_ms=(time.monotonic() - started) * 1000,
         )
         return PostResult(data=data, error=error)
 
