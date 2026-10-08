@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from collections.abc import Collection
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -107,7 +108,9 @@ def write_problem_file(path: Path, sessions: list[dict[str, Any]]) -> None:
     )
 
 
-def aggregate_results(results: list[dict[str, Any]]) -> float:
+def aggregate_results(
+    results: list[dict[str, Any]], *, selected_reader_task_ids: Collection[str] = (),
+) -> float:
     """Average paid task rewards, counting agent failures as zero."""
 
     if not results:
@@ -130,11 +133,13 @@ def aggregate_results(results: list[dict[str, Any]]) -> float:
         raise ValueError(f"generated evaluation integrity failure: {detail}")
 
     harness_count = sum(outcomes.get(o, 0) for o in _HARNESS_OUTCOMES)
-    # Strict > matches Backend's `_is_generated_infra_failure` classifier
-    # (`failed * 10 > total * 3`). A `>=` here would trip at exactly 3/10
-    # while the classifier does NOT recognize that as infra, letting the
-    # miner's auto-discard counter increment for infra we own.
-    if harness_count * 10 > len(results) * 3:
+    # A selected Reader failure is fatal; ordinary rows retain the historical
+    # strict > threshold. Count-token reasons classify either as infrastructure.
+    if any(
+        result["task_id"] in selected_reader_task_ids
+        and result.get("outcome") in _HARNESS_OUTCOMES
+        for result in results
+    ) or harness_count * 10 > len(results) * 3:
         detail = ", ".join(
             f"{outcome}={count}" for outcome, count in sorted(outcomes.items())
         )

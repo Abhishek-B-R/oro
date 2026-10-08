@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock
+import threading
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -34,8 +35,8 @@ def _err(status: int | None, body: str, kind: str = "upstream") -> PostResult:
 
 
 def test_forwards_user_simulator_request_through_inference_proxy() -> None:
-    client = MagicMock()
-    client.post_verbose.return_value = _ok(
+    client = MagicMock(post_verbose_async=AsyncMock())
+    client.post_verbose_async.return_value = _ok(
         {
             "choices": [
                 {
@@ -57,7 +58,7 @@ def test_forwards_user_simulator_request_through_inference_proxy() -> None:
         )
     )
 
-    client.post_verbose.assert_called_once_with(
+    client.post_verbose_async.assert_called_once_with(
         "/inference/chat/completions",
         json_data={
             "model": "mistralai/mistral-small-2603",
@@ -74,10 +75,88 @@ def test_forwards_user_simulator_request_through_inference_proxy() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("reasoning", "extra_fields"),
+    [
+        (None, {}),
+        (False, {"reasoning": {"enabled": False}}),
+        (True, {"reasoning": {"enabled": True}}),
+        ({"effort": "medium"}, {"reasoning": {"effort": "medium"}}),
+    ],
+)
+def test_reasoning_payload_is_opt_in(
+    reasoning: bool | dict | None, extra_fields: dict
+) -> None:
+    client = MagicMock(post_verbose_async=AsyncMock())
+    client.post_verbose_async.return_value = _ok(
+        {"choices": [{"message": {"content": "yes"}, "finish_reason": "stop"}]}
+    )
+    completion = SimulatorCompletion("sk-or-miner-token", client=client)
+    messages = [{"role": "user", "content": "continue?"}]
+
+    asyncio.run(completion("test-model", messages, reasoning=reasoning))
+
+    client.post_verbose_async.assert_called_once_with(
+        "/inference/chat/completions",
+        json_data={
+            "model": "test-model",
+            "messages": messages,
+            "max_tokens": 8192,
+            "temperature": 0.0,
+            "stream": False,
+            **extra_fields,
+        },
+    )
+
+
+@pytest.mark.parametrize("reasoning", [False, {"enabled": False}])
+def test_chutes_simulator_uses_native_instant_setting(reasoning: bool | dict) -> None:
+    client = MagicMock(post_verbose_async=AsyncMock(return_value=_ok(
+        {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]}
+    )))
+    schema = {"type": "json_schema", "json_schema": {"name": "answer", "strict": True, "schema": {"type": "object"}}}
+    asyncio.run(SimulatorCompletion("chutes-miner-token", client=client)(
+        "Qwen/Qwen3.5-397B-A17B-TEE", [], reasoning=reasoning, response_format=schema,
+    ))
+    payload = client.post_verbose_async.call_args.kwargs["json_data"]
+    assert "reasoning" not in payload
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert payload["response_format"] == schema
+
+
+@pytest.mark.parametrize(("model", "reasoning"), [
+    ("Qwen/Qwen3.5-397B-A17B-TEE", True),
+    ("Qwen/Qwen3.5-397B-A17B-TEE", {}),
+    ("Qwen/Qwen3.5-397B-A17B-TEE", {"enabled": 0}),
+    ("Qwen/Qwen3.5-397B-A17B-TEE", {"effort": "low"}),
+    ("Qwen/Qwen3.5-397B-A17B-TEE", {"enabled": False, "effort": "low"}),
+    ("other/model", {"enabled": False}),
+])
+def test_chutes_simulator_rejects_unsupported_reasoning(model: str, reasoning: bool | dict) -> None:
+    client = MagicMock(post_verbose_async=AsyncMock())
+    with pytest.raises(ValueError, match="Unsupported simulator reasoning"):
+        asyncio.run(SimulatorCompletion("chutes-miner-token", client=client)(model, [], reasoning=reasoning))
+    client.post_verbose_async.assert_not_called()
+
+
+def test_forwards_strict_response_format_unchanged() -> None:
+    client = MagicMock(post_verbose_async=AsyncMock(return_value=_ok(
+        {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]}
+    )))
+    schema = {"type": "json_schema", "json_schema": {
+        "name": "answer", "strict": True,
+        "schema": {"type": "object", "additionalProperties": False},
+    }}
+    asyncio.run(SimulatorCompletion("sk-or-miner", client=client)(
+        "test-model", [], response_format=schema,
+    ))
+    assert client.post_verbose_async.call_args.kwargs["json_data"]["response_format"] == schema
+
+
 def test_decide_posts_to_decisions_endpoint_once() -> None:
-    client = MagicMock()
+    client = MagicMock(post_verbose_async=AsyncMock())
     answers = {"model": "typesafe/jev-1.13", "answers": {"all": {"noul": 0.1}}}
-    client.post_verbose.return_value = _ok(answers)
+    client.post_verbose_async.return_value = _ok(answers)
     completion = SimulatorCompletion("sk-or-miner-token", client=client)
     questions = {"all": {"type": "noul", "instructions": "Asks for everything?"}}
 
@@ -85,7 +164,7 @@ def test_decide_posts_to_decisions_endpoint_once() -> None:
         completion.decide("typesafe/jev-1.13", {"message": "hi"}, questions)
     )
 
-    client.post_verbose.assert_called_once_with(
+    client.post_verbose_async.assert_called_once_with(
         "/inference/alpha/decisions",
         json_data={
             "model": "typesafe/jev-1.13",
@@ -97,18 +176,18 @@ def test_decide_posts_to_decisions_endpoint_once() -> None:
     # The proxy lets only the validator's own calls read decisions.
     assert client.headers == {VALIDATOR_CALLER_HEADER: VALIDATOR_CALLER_SECRET}
 
-    client.post_verbose.reset_mock()
-    client.post_verbose.return_value = _err(403, "model not allowed")
+    client.post_verbose_async.reset_mock()
+    client.post_verbose_async.return_value = _err(403, "model not allowed")
     with pytest.raises(InferenceProviderError) as exc:
         asyncio.run(completion.decide("typesafe/jev-1.13", {}, questions))
     assert (exc.value.status, exc.value.body) == (403, "model not allowed")
-    client.post_verbose.assert_called_once()
+    client.post_verbose_async.assert_called_once()
 
     # No response is a transport failure (an outage); a malformed answer carries no status.
-    client.post_verbose.return_value = _err(None, "no response", kind="network")
+    client.post_verbose_async.return_value = _err(None, "no response", kind="network")
     with pytest.raises(ConnectionError):
         asyncio.run(completion.decide("typesafe/jev-1.13", {}, questions))
-    client.post_verbose.return_value = PostResult(data=["not", "an", "object"], error=None)
+    client.post_verbose_async.return_value = PostResult(data=["not", "an", "object"], error=None)
     with pytest.raises(InferenceProviderError) as exc:
         asyncio.run(completion.decide("typesafe/jev-1.13", {}, questions))
     assert exc.value.status is None
@@ -122,8 +201,8 @@ def test_a_run_on_another_provider_offers_no_decisions() -> None:
 
 def test_raises_after_bounded_retries_exhaust_on_upstream_403() -> None:
     """Persistent upstream error → InferenceProviderError with the provider body."""
-    client = MagicMock()
-    client.post_verbose.return_value = _err(
+    client = MagicMock(post_verbose_async=AsyncMock())
+    client.post_verbose_async.return_value = _err(
         403, '{"error":{"message":"rate limit exceeded","code":"rate_limit_exceeded"}}'
     )
     completion = SimulatorCompletion("miner-token", client=client)
@@ -134,7 +213,7 @@ def test_raises_after_bounded_retries_exhaust_on_upstream_403() -> None:
     assert excinfo.value.status == 403
     assert "rate_limit_exceeded" in excinfo.value.body
     # Retry budget fully spent before escalating.
-    assert client.post_verbose.call_count == simulator_completion._MAX_ATTEMPTS
+    assert client.post_verbose_async.call_count == simulator_completion._MAX_ATTEMPTS
 
 
 @pytest.mark.parametrize(
@@ -148,17 +227,42 @@ def test_raises_after_bounded_retries_exhaust_on_upstream_403() -> None:
 def test_key_exhaustion_is_narrowly_detected_and_not_retried(
     status: int, body: str, exhausted: bool
 ) -> None:
-    client = MagicMock()
-    client.post_verbose.return_value = _err(status, body)
+    client = MagicMock(post_verbose_async=AsyncMock())
+    client.post_verbose_async.return_value = _err(status, body)
     completion = SimulatorCompletion("miner-token", client=client)
 
     with pytest.raises(InferenceProviderError) as excinfo:
         asyncio.run(completion("model", []))
 
     assert excinfo.value.key_exhausted is exhausted
-    assert client.post_verbose.call_count == (
+    assert client.post_verbose_async.call_count == (
         1 if exhausted else simulator_completion._MAX_ATTEMPTS
     )
+
+
+@pytest.mark.parametrize("decisions", [False, True])
+def test_provider_error_redacts_the_miner_credential(decisions, caplog) -> None:
+    token = "sk-or-test-miner"
+    client = MagicMock(post_verbose_async=AsyncMock(return_value=_err(
+        403, f"Key limit exceeded for {token}",
+    )))
+    exhausted = threading.Event()
+    completion = SimulatorCompletion(token, client=client, key_exhausted_event=exhausted)
+    with pytest.raises(InferenceProviderError) as raised:
+        asyncio.run(completion.decide("test", {}, {}) if decisions else completion("test", []))
+    assert exhausted.is_set()
+    assert token not in raised.value.body
+    assert token not in str(raised.value)
+    assert token not in caplog.text
+
+
+def test_provider_message_redacts_the_miner_credential() -> None:
+    token = "sk-or-test-miner"
+    client = MagicMock(post_verbose_async=AsyncMock(return_value=_ok({
+        "choices": [{"message": {"content": f"Unexpected echo {token}"}, "finish_reason": "stop"}],
+    })))
+    result = asyncio.run(SimulatorCompletion(token, client=client)("test", []))
+    assert token not in result["text"]
 
 
 def test_backoff_walks_full_schedule_before_giving_up(
@@ -171,8 +275,8 @@ def test_backoff_walks_full_schedule_before_giving_up(
         slept.append(seconds)
 
     monkeypatch.setattr(simulator_completion.asyncio, "sleep", _record)
-    client = MagicMock()
-    client.post_verbose.return_value = _err(503, "still down")
+    client = MagicMock(post_verbose_async=AsyncMock())
+    client.post_verbose_async.return_value = _err(503, "still down")
     completion = SimulatorCompletion("miner-token", client=client)
 
     with pytest.raises(InferenceProviderError):
@@ -206,8 +310,8 @@ def test_bails_out_early_when_wall_budget_would_be_exceeded(
         return original_post
 
     monkeypatch.setattr(simulator_completion.time, "monotonic", lambda: now[0])
-    client = MagicMock()
-    client.post_verbose.side_effect = slow_post
+    client = MagicMock(post_verbose_async=AsyncMock())
+    client.post_verbose_async.side_effect = slow_post
     completion = SimulatorCompletion("miner-token", client=client)
 
     with pytest.raises(InferenceProviderError) as excinfo:
@@ -216,28 +320,28 @@ def test_bails_out_early_when_wall_budget_would_be_exceeded(
     # After attempt 1 (30s elapsed) + backoff 5s + 3s headroom = 38s < 55s → sleeps.
     # After attempt 2 (60s elapsed) + backoff 10s + 3s headroom = 73s > 55s → bail.
     assert slept == [simulator_completion._RETRY_BACKOFFS_S[0]]
-    assert client.post_verbose.call_count == 2
+    assert client.post_verbose_async.call_count == 2
     assert excinfo.value.status == 429
 
 
 def test_retries_on_transient_upstream_then_recovers() -> None:
     """ORO-2189: a single provider blip (503 body) must not sink the task."""
     good = _ok({"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
-    client = MagicMock()
-    client.post_verbose.side_effect = [_err(503, '{"error":"upstream"}'), good]
+    client = MagicMock(post_verbose_async=AsyncMock())
+    client.post_verbose_async.side_effect = [_err(503, '{"error":"upstream"}'), good]
     completion = SimulatorCompletion("miner-token", client=client)
 
     result = asyncio.run(completion("model", [{"role": "user", "content": "hi"}]))
 
     assert result["text"] == "ok"
-    assert client.post_verbose.call_count == 2
+    assert client.post_verbose_async.call_count == 2
 
 
 def test_retries_on_network_error_then_recovers() -> None:
     """A network-error PostResult also retries — kind=network, status=None."""
     good = _ok({"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
-    client = MagicMock()
-    client.post_verbose.side_effect = [
+    client = MagicMock(post_verbose_async=AsyncMock())
+    client.post_verbose_async.side_effect = [
         _err(None, "no response (network error or timeout)", kind="network"),
         good,
     ]
@@ -246,15 +350,15 @@ def test_retries_on_network_error_then_recovers() -> None:
     result = asyncio.run(completion("model", []))
 
     assert result["text"] == "ok"
-    assert client.post_verbose.call_count == 2
+    assert client.post_verbose_async.call_count == 2
 
 
 def test_terminal_error_from_network_failure_has_none_status() -> None:
     """When every attempt is a network error, InferenceProviderError still fires
     but with ``status=None`` so callers can distinguish "provider said 500"
     from "we never reached them"."""
-    client = MagicMock()
-    client.post_verbose.return_value = _err(
+    client = MagicMock(post_verbose_async=AsyncMock())
+    client.post_verbose_async.return_value = _err(
         None, "no response (network error or timeout)", kind="network"
     )
     completion = SimulatorCompletion("miner-token", client=client)
@@ -269,14 +373,14 @@ def test_terminal_error_from_network_failure_has_none_status() -> None:
 def test_retries_on_malformed_body_then_recovers() -> None:
     """200 with no ``choices[0].message`` (ORO-2191 non-blocker case) — retries."""
     good = _ok({"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
-    client = MagicMock()
-    client.post_verbose.side_effect = [_ok({"choices": [{}]}), good]
+    client = MagicMock(post_verbose_async=AsyncMock())
+    client.post_verbose_async.side_effect = [_ok({"choices": [{}]}), good]
     completion = SimulatorCompletion("miner-token", client=client)
 
     result = asyncio.run(completion("model", []))
 
     assert result["text"] == "ok"
-    assert client.post_verbose.call_count == 2
+    assert client.post_verbose_async.call_count == 2
 
 
 def test_concurrent_sessions_do_not_race_on_error_signal() -> None:
@@ -290,8 +394,8 @@ def test_concurrent_sessions_do_not_race_on_error_signal() -> None:
     # each getting a distinct PostResult on their own call. If a future
     # refactor accidentally reintroduces shared state, the second caller
     # would see the first's error.
-    client = MagicMock()
-    client.post_verbose.side_effect = [
+    client = MagicMock(post_verbose_async=AsyncMock())
+    client.post_verbose_async.side_effect = [
         *[_err(429, "session-A body")] * simulator_completion._MAX_ATTEMPTS,
         *[_err(500, "session-B body")] * simulator_completion._MAX_ATTEMPTS,
     ]

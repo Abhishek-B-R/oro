@@ -14,7 +14,9 @@ the qualifying inference path.
 
 The practice EnvPack is included at `data/local-test/env-pack.tar.gz` using Git
 LFS. It holds qualifying rows only: the runner refuses a pack with any race row,
-so local scores never come from race material. The local runner verifies the
+so local scores never come from race material. Its existing 30 practice tasks
+and grading are unchanged; the delivery now declares runtime contract 4 for
+`oro-env-runtime` 3.5. The local runner verifies the
 pack's digest, its runtime contracts, and the matching search-index identity
 before it starts the agent sandbox, and prints them in the run header.
 Your agent file must define a synchronous callable
@@ -77,6 +79,9 @@ Keep your existing `.env`, or copy `.env.example` for a new checkout. Set
 `OPENROUTER_API_KEY` or `CHUTES_API_KEY`. Both keys may remain configured;
 `INFERENCE_PROVIDER=chutes` or `INFERENCE_PROVIDER=openrouter` selects one.
 Without an explicit choice, OpenRouter takes precedence when both keys exist.
+Runtime 3.5 Reader tasks require OpenRouter’s Jev decisions endpoint and cannot
+run through Chutes; ordinary legacy qualifying tasks without a configured Reader
+are unaffected.
 `SANDBOX_MODEL` is an optional override used by the included reference agent.
 Its default is
 `deepseek-ai/DeepSeek-V3.2-TEE`, preserving the existing local-testing default.
@@ -143,9 +148,9 @@ parentheses:
 
 ```text
 ORO Bench local run  local-7c1f2a
-  pack        f75b76c8…cd0c
+  pack        6172495e…8f28bb
   problems    5 of 30, qualifying roster
-  runtime     0.3.4
+  runtime     0.3.5
   inference   openrouter
   agent       my_agent.py  sha256 3f9c1d7b0000…
   agent model deepseek-ai/DeepSeek-V3.2-TEE  (SANDBOX_MODEL, requested by the reference
