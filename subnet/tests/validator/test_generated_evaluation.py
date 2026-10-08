@@ -64,6 +64,28 @@ def test_score_is_mean_reward_with_agent_failures_as_zero() -> None:
     assert score == 0.25
 
 
+@pytest.mark.parametrize("outcome", ["environment_error", "verifier_error"])
+def test_reader_work_rejects_even_one_infrastructure_row(outcome) -> None:
+    results = [_result(str(i), correct=True, reward=1) for i in range(10)]
+    results[0] = _result("0", correct=False, outcome=outcome)
+    assert aggregate_results(results) == 0.9
+    with pytest.raises(ValueError, match="generated evaluation infrastructure failure"):
+        aggregate_results(results, selected_reader_task_ids={"0"})
+
+
+def test_reader_work_keeps_low_rewards_and_agent_errors_as_scores() -> None:
+    results = [_result("one", correct=True, reward=0.03), _result("two", correct=False, outcome="agent_error")]
+    assert aggregate_results(results, selected_reader_task_ids={"one", "two"}) == 0.015
+
+
+@pytest.mark.parametrize("outcome", ["exploit", "leakage"])
+def test_reader_infrastructure_failures_do_not_hide_integrity_failures(outcome) -> None:
+    results = [_result("one", correct=False, outcome="environment_error"),
+               _result("two", correct=False, outcome=outcome)]
+    with pytest.raises(ValueError, match="generated evaluation integrity failure"):
+        aggregate_results(results, selected_reader_task_ids={"one"})
+
+
 @pytest.mark.parametrize(
     ("provider", "stats", "expected_status"),
     [
@@ -328,6 +350,50 @@ def test_generated_runner_delivers_failed_completion(
     validator.session_runtime.clear.assert_called_once_with(registry)
 
 
+@pytest.mark.parametrize("reader_task,outcome,failed", [
+    ("0", "environment_error", True), ("0", "verifier_error", True),
+    ("1", "environment_error", False), ("1", "verifier_error", False),
+    ("hidden", "environment_error", False), ("0", "agent_error", False),
+    ("0", "completed", False),
+])
+def test_generated_reader_failure_policy_uses_selected_roster(
+    tmp_path, monkeypatch, reader_task, outcome, failed,
+) -> None:
+    roster = {str(i): "right" for i in range(10)}
+    results = [{**_result(task, correct=True, reward=0.0 if task == "0" and outcome != "completed" else 0.1,
+                         outcome=outcome if task == "0" else "completed"),
+                "family": "right", "evaluation_run_id": "run", "agent_version_id": "agent",
+                "pack_sha256": "a" * 64} for task in roster]
+    registry = MagicMock()
+    registry.key_exhausted = threading.Event()
+    registry.finalized_results.return_value = results
+    registry.loaded_pack.task_ids = [*roster, "hidden"]
+    registry.loaded_pack.task_specs = [
+        SimpleNamespace(situation=SimpleNamespace(reader=task == reader_task))
+        for task in registry.loaded_pack.task_ids
+    ]
+    monkeypatch.setattr(validator_main, "GeneratedProgressReporter", MagicMock())
+    validator = Validator.__new__(Validator)
+    validator._create_environment_sessions = MagicMock(return_value=(registry, [], roster))
+    validator._eval_dir = MagicMock(return_value=tmp_path)
+    validator.run_sandbox = MagicMock(return_value=(tmp_path / "output.jsonl", {}))
+    validator.session_runtime = MagicMock()
+    validator.backend_client = MagicMock()
+    work = SimpleNamespace(env_pack_sha256="a" * 64, eval_run_id="run", agent_version_id="agent")
+    completion = validator._run_generated_evaluation(
+        work, tmp_path / "agent.py", inference_access_token="synthetic",
+        inference_provider="openrouter", inference_base_url="https://example.test/v1",
+    )
+    if failed:
+        assert completion is None
+        failure = validator.backend_client.complete_run.call_args.kwargs
+        assert failure["status"] == validator_main.TerminalStatus.FAILED
+        assert failure["failure_reason"] == f"generated evaluation infrastructure failure: completed=9, {outcome}=1"
+    else:
+        assert completion.score == pytest.approx(0.1 if outcome == "completed" else 0.09)
+        validator.backend_client.complete_run.assert_not_called()
+
+
 def test_generated_runner_partial_scores_on_miner_key_exhaustion(tmp_path, monkeypatch):
     """When the miner's per-run inference key hits its cap mid-run, the
     completed episodes are scored and the run is marked SUCCESS with a
@@ -467,6 +533,8 @@ def test_generated_sessions_use_exact_authoritative_subset_without_hidden_bank(
     _, sessions, roster = validator._create_environment_sessions(
         work, inference_access_token="unused"
     )
+    assert validator_main.SessionRegistry.call_args.kwargs["inference_access_token"] == "unused"
+    assert "simulator_access_token" not in validator_main.SessionRegistry.call_args.kwargs
     validator.backend_client.get_run_problems.assert_called_once_with(work.eval_run_id)
     assert [
         call.kwargs["task_id"] for call in registry.start.call_args_list
@@ -707,6 +775,7 @@ def test_generated_runner_retains_agent_inference_summary(
                     "problem_id": "session",
                     "_shadow_inference_usage": output_stats,
                     "dialogue": [],
+                    "miner_echo": "sk-or-test-miner",
                 }
             )
             + "\n"
@@ -715,7 +784,7 @@ def test_generated_runner_retains_agent_inference_summary(
     completion = validator._run_generated_evaluation(
         work,
         tmp_path / "agent.py",
-        inference_access_token="token",
+        inference_access_token="sk-or-test-miner",
         inference_provider="openrouter",
         inference_base_url="https://example.test/v1",
     )
@@ -724,6 +793,10 @@ def test_generated_runner_retains_agent_inference_summary(
     reporter.stop.assert_called()
     reporter.flush.assert_called_once_with([result])
     validator.session_runtime.clear.assert_called_once_with(registry)
+    reporter_type.call_args.args[1]([result])
+    assert "sk-or-test-miner" not in json.dumps(
+        validator._emit_environment_result_batch.call_args.kwargs["inference_transcripts"]
+    )
     assert completion is not None
     assert completion.score == 0.5
     usage = completion.sandbox_metadata["_shadow_resource_usage"]["by_episode"][

@@ -97,6 +97,11 @@ def create_session_app(runtime: SessionRuntime) -> FastAPI:
         authorization: str | None = Header(default=None),
         x_oro_validator: str | None = Header(default=None),
     ) -> Response:
+        # Read by the proxy only: the validator's own calls carry its secret.
+        # Bytes: a str compare raises on a non-ASCII header.
+        validator = x_oro_validator is not None and compare_digest(
+            x_oro_validator.encode(), VALIDATOR_CALLER_SECRET.encode()
+        )
         run_id, authorized = runtime.authorize_inference(authorization)
         headers = {"X-ORO-Run-ID": run_id} if run_id else None
         if not authorized:
@@ -105,11 +110,6 @@ def create_session_app(runtime: SessionRuntime) -> FastAPI:
                 detail="Inference key does not match active run",
                 headers=headers,
             )
-        # Read by the proxy only: the validator's own calls carry its secret.
-        # Bytes: a str compare raises on a non-ASCII header.
-        validator = x_oro_validator is not None and compare_digest(
-            x_oro_validator.encode(), VALIDATOR_CALLER_SECRET.encode()
-        )
         headers = {**(headers or {}), "X-ORO-Caller": "validator" if validator else "agent"}
         return Response(status_code=204, headers=headers)
 

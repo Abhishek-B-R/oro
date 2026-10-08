@@ -9,7 +9,8 @@ import hashlib
 import json
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
 from uuid import uuid4
@@ -36,6 +37,7 @@ MAX_CALLS_PER_TURN = 16
 # per attempt, so a shorter budget would quarantine sessions the provider would
 # still answer.
 DEFAULT_SIMULATOR_TIMEOUT_S = 60.0
+_SIMULATOR_DEADLINE: ContextVar[float] = ContextVar("simulator_deadline")
 _PACK_PROVENANCE_FIELDS = (
     "contract_version",
     "runtime_version",
@@ -247,22 +249,26 @@ class SessionRegistry:
         self.key_exhausted = threading.Event()
 
     def _default_simulator(self, state: _SessionState) -> UserSim:
-        if self._inference_access_token is None:
+        session = state.session
+        reader = session.task.situation and session.task.situation.reader
+        token = self._inference_access_token
+        if token is None:
             raise RuntimeError(
                 "miner inference credentials are required for user simulation"
             )
         completion = SimulatorCompletion(
-            self._inference_access_token,
+            token,
             proxy_url=self._simulator_proxy_url,
             inference_stats_file=self._inference_stats_file,
             episode_id=state.session_id,
+            key_exhausted_event=self.key_exhausted,
         )
-        session = state.session
         return UserSim(
             session.task,
             model=session.model_roles["user_simulator"],
             surface_events=not session.state_blind,
             completion=completion,
+            reader_completion=completion if reader else None,
             fired=lambda: session.env.fired_transitions,
         )
 
@@ -279,12 +285,19 @@ class SessionRegistry:
         self, state: _SessionState, signal: dict[str, Any] | None
     ) -> dict[str, Any]:
         self._simulator(state)
-        decision = asyncio.run(state.simulator.respond(state.transcript, signal))
+        decision = self._run_simulator(state.simulator.respond(state.transcript, signal))
         if not isinstance(decision, dict):
             raise TypeError("simulator response must be an object")
         if signal is not None:
             decision = state.simulator.ensure_react(decision, signal)
         return decision
+
+    def _run_simulator(self, coroutine: Coroutine[Any, Any, Any]) -> Any:
+        async def bounded() -> Any:
+            remaining = max(0.0, _SIMULATOR_DEADLINE.get() - time.monotonic())
+            return await asyncio.wait_for(coroutine, timeout=remaining)
+
+        return asyncio.run(bounded())
 
     @staticmethod
     def _simulator_exchanges(simulator: Any | None) -> list[dict[str, Any]]:
@@ -310,7 +323,9 @@ class SessionRegistry:
         if signal is not None or (message_sent and not lines):
             decisions.append((self._simulator_response(state, signal), signal))
         if lines:
-            asyncio.run(loop.reword_utterances(self._simulator(state), state.session))
+            self._run_simulator(
+                loop.reword_utterances(self._simulator(state), state.session)
+            )
         return decisions
 
     def start(
@@ -519,7 +534,9 @@ class SessionRegistry:
     def _simulator_error(
         self, state: _SessionState, exc: Exception
     ) -> tuple[type[HarnessExecutionError], str]:
-        if isinstance(exc, InferenceProviderError) and exc.key_exhausted:
+        if self.key_exhausted.is_set() or (
+            isinstance(exc, InferenceProviderError) and exc.key_exhausted
+        ):
             self.key_exhausted.set()
             state.quarantined_outcome = "agent_error"
             summary = "miner inference key exhausted"
@@ -544,22 +561,26 @@ class SessionRegistry:
         snapshot: dict[str, Any],
         cause: concurrent.futures.TimeoutError,
     ) -> NoReturn:
+        error_type = HarnessTimeoutError
+        if self.key_exhausted.is_set():
+            error_type, reason = self._simulator_error(state, cause)
         state.quarantined_reason = reason
         trace.record(
             state,
             state_hash_after=snapshot["state_hash"],
-            error_type="HarnessTimeoutError",
+            error_type=error_type.__name__,
             error_detail=state.quarantined_reason,
+            simulator_exchanges=self._simulator_exchanges(state.simulator),
         )
         state.final_result = self._result(
             session_id,
             state,
-            outcome="environment_error",
+            outcome=state.quarantined_outcome,
             verdict=None,
             error_detail=state.quarantined_reason,
             snapshot=snapshot,
         )
-        raise HarnessTimeoutError(
+        raise error_type(
             f"{state.quarantined_reason}; session quarantined"
         ) from cause
 
@@ -618,17 +639,28 @@ class SessionRegistry:
         session_id: str,
         state: _SessionState,
         trace: _CallTrace,
+        deadline: float,
         work: Callable[..., Any],
         *args: Any,
     ) -> Any:
         """Run simulator work under its timeout; a failure quarantines the session."""
         started = time.perf_counter()
+        previous_latency_ms = trace.simulator_latency_ms or 0.0
         snapshot = self._session_snapshot(state)
-        future = self._executor.submit(work, *args)
+
+        def bounded_work() -> Any:
+            # All response/reword phases share the deadline, including queue time.
+            token = _SIMULATOR_DEADLINE.set(deadline)
+            try:
+                return work(*args)
+            finally:
+                _SIMULATOR_DEADLINE.reset(token)
+
+        future = self._executor.submit(bounded_work)
         try:
-            result = future.result(timeout=self.simulator_timeout_s)
-        except concurrent.futures.TimeoutError as exc:
-            trace.simulator_latency_ms = _elapsed_ms(started)
+            result = future.result(timeout=max(0.0, deadline - time.monotonic()))
+        except (concurrent.futures.TimeoutError, asyncio.TimeoutError) as exc:
+            trace.simulator_latency_ms = previous_latency_ms + _elapsed_ms(started)
             future.cancel()
             self._raise_timeout(
                 session_id,
@@ -639,7 +671,7 @@ class SessionRegistry:
                 cause=exc,
             )
         except Exception as exc:
-            trace.simulator_latency_ms = _elapsed_ms(started)
+            trace.simulator_latency_ms = previous_latency_ms + _elapsed_ms(started)
             # Only trusted provider failures may surface status and body;
             # arbitrary simulator messages can contain private task material.
             error_type, state.quarantined_reason = self._simulator_error(state, exc)
@@ -657,9 +689,7 @@ class SessionRegistry:
                 else "user simulator failed"
             )
             raise error_type(f"{public}; session quarantined") from exc
-        trace.simulator_latency_ms = (trace.simulator_latency_ms or 0.0) + _elapsed_ms(
-            started
-        )
+        trace.simulator_latency_ms = previous_latency_ms + _elapsed_ms(started)
         return result
 
     def _simulate_user_turn(
@@ -673,6 +703,7 @@ class SessionRegistry:
         env = state.session.env
         if env.done():
             return None
+        deadline = time.monotonic() + self.simulator_timeout_s
         said = len(state.transcript)
         message_sent = any(
             item["action"].get("name") == "message" for item in call_group
@@ -690,6 +721,7 @@ class SessionRegistry:
                 session_id,
                 state,
                 trace,
+                deadline,
                 self._shopper_turn_decisions,
                 state,
                 signal,
@@ -708,7 +740,8 @@ class SessionRegistry:
                     session_id,
                     state,
                     trace,
-                    lambda: asyncio.run(
+                    deadline,
+                    lambda: self._run_simulator(
                         loop.reword_utterances(self._simulator(state), state.session)
                     ),
                 )
