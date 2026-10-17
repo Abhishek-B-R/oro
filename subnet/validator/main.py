@@ -4,6 +4,7 @@ import gzip
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import threading
@@ -457,8 +458,9 @@ class Validator:
         """
         d = Path(self.config.workspace_dir) / "logs" / f"eval_{eval_run_id_str}"
         d.mkdir(parents=True, exist_ok=True)
-        # Sandbox runs as --user 1000:1000, ensure it can write to this directory
-        os.chmod(d, 0o777)
+        # Sandbox runs as --user 1000:1000, ensure it can write to this directory.
+        # The sticky bit keeps the validator's own files (logs, inputs) in place.
+        os.chmod(d, 0o1777)
         return d
 
     @staticmethod
@@ -607,7 +609,9 @@ class Validator:
 
             # Always log sandbox output for debugging
             if stderr_log.exists():
-                stderr_content = read_text_lossy(stderr_log)
+                stderr_content = read_text_lossy(
+                    stderr_log, self.config.sandbox_log_max_bytes
+                )
                 if stderr_content.strip():
                     metadata["stderr_tail"] = stderr_content[-500:]
                     log_fn = logging.error if returncode != 0 else logging.info
@@ -616,7 +620,9 @@ class Validator:
                     )
 
             if stdout_log.exists():
-                stdout_content = read_text_lossy(stdout_log)
+                stdout_content = read_text_lossy(
+                    stdout_log, self.config.sandbox_log_max_bytes
+                )
                 if stdout_content.strip():
                     logging.info(
                         f"Sandbox stdout for eval_run {eval_run_id}:\n{stdout_content}"
@@ -647,7 +653,9 @@ class Validator:
                     f"Output file not found after sandbox execution: {output_file}"
                 )
                 if stderr_log.exists():
-                    stderr_content = read_text_lossy(stderr_log)
+                    stderr_content = read_text_lossy(
+                        stderr_log, self.config.sandbox_log_max_bytes
+                    )
                     if stderr_content.strip():
                         logging.error(f"Sandbox stderr:\n{stderr_content}")
                 return None, metadata
@@ -664,7 +672,9 @@ class Validator:
             # own internal timeout. Kill the orphan by name (ORO-1414).
             self._kill_sandbox_container(eval_run_id)
             if stderr_log.exists():
-                stderr_content = read_text_lossy(stderr_log)
+                stderr_content = read_text_lossy(
+                    stderr_log, self.config.sandbox_log_max_bytes
+                )
                 if stderr_content.strip():
                     metadata["stderr_tail"] = stderr_content[-500:]
             logging.warning(
@@ -1654,6 +1664,8 @@ class Validator:
                 inference_access_token,
                 work.inference_token.expires_at.timestamp(),
             )
+            # Start from an empty directory, even after a crashed earlier attempt.
+            shutil.rmtree(self._eval_dir(eval_run_id_str))
             # Step 1: Download agent code
             agent_path = self.download_agent(work.code_download_url, eval_run_id_str)
             if not agent_path:
@@ -1701,8 +1713,6 @@ class Validator:
             eval_dir = self._eval_dir(eval_run_id_str)
             if eval_dir.exists():
                 try:
-                    import shutil
-
                     shutil.rmtree(eval_dir)
                 except OSError as e:
                     logging.debug(f"Cleanup failed for {eval_dir}: {e}")
