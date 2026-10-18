@@ -1268,7 +1268,7 @@ wheels = [
 
 [[package]]
 name = "oro-env-runtime"
-version = "3.5.0"
+version = "3.7.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
@@ -1277,7 +1277,7 @@ dependencies = [
     { name = "pydantic" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c6/dd/f95f0437d92bd6d550eb6d527abd8fb5070dbadbbdc787497612bbdc305c/oro_env_runtime-3.5.0-py3-none-any.whl", hash = "sha256:20ca48d4ab23c4a733703a032aeba3016053ca9148c55bea30d441390c98f315", size = 73255, upload-time = "2026-10-08T07:57:52.293Z" },
+    { url = "https://files.pythonhosted.org/packages/73/47/6a307371021c7768bc56f2225a8168c6a49a58d0599bbf353c614ae49416/oro_env_runtime-3.7.1-py3-none-any.whl", hash = "sha256:314b518c841d3a1225ea376dbfafb8076c14a7a96ba34b13b4212d4f8150c663", size = 78347, upload-time = "2026-10-13T22:11:44.535Z" },
 ]
 
 [[package]]
@@ -1350,8 +1350,8 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-local-test = [{ name = "oro-env-runtime", specifier = "==3.5.0" }]
-validator = [{ name = "oro-env-runtime", specifier = "==3.5.0" }]
+local-test = [{ name = "oro-env-runtime", specifier = "==3.7.1" }]
+validator = [{ name = "oro-env-runtime", specifier = "==3.7.1" }]
 
 [[package]]
 name = "packaging"
