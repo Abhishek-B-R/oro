@@ -38,6 +38,34 @@ Settings (environment):
 Inside the compose network the service is `http://search-server:5632`; the validator reads
 `SEARCH_SERVER_URL`. Logs go to stderr (`docker compose logs -f search-server`).
 
+## CA bundle security updates
+
+The Python requirements and images require `certifi>=2026.10.19`; pip-based
+images bootstrap from [Python's incident notice](https://discuss.python.org/t/information-for-python-users-regarding-emudhra-emsign-ca-certificate-security-incident/109576)'s pip 26.2.2 wheel and verify
+its SHA-256 hash before installing dependencies. The validator image uses uv
+0.13.4 to install that same hash-checked wheel.
+After updating this repository, rebuild the source images, then recreate the
+long-running services. The local `test` image uses the validator Dockerfile and
+is one-shot; rebuilding it updates the next local test run, so rerun your usual
+local test command after the build.
+
+```bash
+docker compose build --pull validator sandbox search-server test
+docker compose --profile validator up -d --force-recreate validator search-server
+```
+
+For an existing host Python environment, upgrade pip and certifi, reinstall the
+project requirements, then restart Python processes using that environment:
+
+```bash
+python -m pip install --no-deps \
+  'pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70'
+python -m pip install 'certifi>=2026.10.19'
+python -m pip install -r requirements.txt
+```
+
+For uv-managed environments, use uv 0.13.4 or later and resync the environment.
+
 ## Image Caching and Reuse
 
 Docker automatically caches image layers, which significantly speeds up rebuilds:
