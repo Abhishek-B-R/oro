@@ -88,6 +88,28 @@ class TestExecuteSingleProblemStatus:
         assert result.status == SandboxProblemStatus.FAILED
         assert result.success is False
 
+    def test_abrupt_exit_does_not_read_partial_queue_item(self, tmp_path, monkeypatch):
+        """An abnormal exit can leave a partial queue message."""
+        monkeypatch.setenv("SANDBOX_OUTPUT_FILE", str(tmp_path / "output.jsonl"))
+
+        result_queue = MagicMock()
+        result_queue.get.side_effect = queue.Empty
+        result_queue.get_nowait.side_effect = EOFError("partial queue item")
+        mock_proc = MagicMock()
+        mock_proc.pid = 3
+        mock_proc.exitcode = 1
+        mock_proc.is_alive.return_value = False
+        with patch.object(
+            sandbox_executor._MP_CTX, "Queue", return_value=result_queue
+        ), patch.object(sandbox_executor._MP_CTX, "Process", return_value=mock_proc):
+            result = sandbox_executor.execute_single_problem(
+                {"query": "q", "problem_id": "p3"}, timeout=5
+            )
+
+        assert result.status == SandboxProblemStatus.FAILED
+        assert "produced no result" in result.error
+        result_queue.get_nowait.assert_not_called()
+
     def test_result_put_just_before_exit_is_not_lost(self, tmp_path, monkeypatch):
         """The child can put its result and exit between a timed-out get()
         and the liveness check. The result is already in the queue then, so
